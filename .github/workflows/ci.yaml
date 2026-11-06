@@ -144,6 +144,7 @@ jobs:
         with:
           post-setup-script: flutter config --enable-swift-package-manager
       - name: Wait for simulator
+        id: wait-simulator
         timeout-minutes: 10
         run: xcrun simctl bootstatus "${{ steps.simulator.outputs.udid }}"
       - name: Dart integration tests
@@ -152,8 +153,9 @@ jobs:
           FLUTTER: flutter
           SUITES: dart
         run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+      # Runs after a failed Dart suite too, but not when the simulator never came up.
       - name: Native bridge tests (XCTest)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.wait-simulator.outcome == 'success' }}
         timeout-minutes: 15
         env:
           FLUTTER: flutter
@@ -190,6 +192,8 @@ jobs:
     timeout-minutes: 45
     env:
       ANDROID_API_LEVEL: 34
+      # Set explicitly, so avdmanager, the config edit below and the emulator all use the same directory.
+      ANDROID_AVD_HOME: /home/runner/.android/avd
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -222,8 +226,10 @@ jobs:
           tools="$ANDROID_HOME/cmdline-tools/latest/bin"
           yes | "$tools/sdkmanager" --licenses > /dev/null
           "$tools/sdkmanager" --install emulator "$image" > /dev/null
+          mkdir -p "$ANDROID_AVD_HOME"
           echo no | "$tools/avdmanager" create avd --force -n ci -k "$image"
-          printf 'hw.cpu.ncore=2\ndisk.dataPartition.size=4096M\n' >> ~/.android/avd/ci.avd/config.ini
+          "$tools/avdmanager" list avd
+          printf 'hw.cpu.ncore=2\ndisk.dataPartition.size=4096M\n' >> "$ANDROID_AVD_HOME/ci.avd/config.ini"
           nohup "$ANDROID_HOME/emulator/emulator" -avd ci -port 5554 -no-window -gpu swiftshader_indirect \
             -no-snapshot -noaudio -no-boot-anim -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 &
           echo "$!" > "$RUNNER_TEMP/emulator.pid"
@@ -269,6 +275,7 @@ jobs:
         working-directory: example/android
         run: ./gradlew :connect_native_http:assembleDebugAndroidTest
       - name: Wait for emulator
+        id: emulator
         timeout-minutes: 5
         run: |
           adb="$ANDROID_HOME/platform-tools/adb"
@@ -289,8 +296,9 @@ jobs:
           FLUTTER: flutter
           SUITES: dart
         run: ./run_integration_tests.sh android emulator-5554
+      # Runs after a failed Dart suite too, but not when the emulator never came up.
       - name: Native bridge tests (instrumented)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.emulator.outcome == 'success' }}
         timeout-minutes: 15
         env:
           FLUTTER: flutter
