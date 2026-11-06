@@ -1,0 +1,25 @@
+name: connect_native_http_example
+description: Integration tests for connect_native_http on iOS and Android, against test_server/.
+publish_to: none
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.12.0 <4.0.0"
+
+dependencies:
+  connect_native_http:
+    path: ../
+  connectrpc: ^2.0.0
+  flutter:
+    sdk: flutter
+  protobuf: ^6.0.0
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

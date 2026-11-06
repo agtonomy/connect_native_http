@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Trusts the CA test_server writes on each start, which ../run_integration_tests.sh copies to res/raw. Cronet
+     still refuses QUIC with it (it is not a public root), so the local runs on Android use HTTP/2. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/test_server_ca" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -1,0 +1,29 @@
+name: connect_native_http
+description: >-
+  connect-dart HttpClients on the platform HTTP stacks, URLSession on iOS and Cronet on Android, so Connect calls
+  can use HTTP/3 with full-duplex streams.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ">=3.12.0 <4.0.0"
+  flutter: ">=3.44.0"
+
+dependencies:
+  connectrpc: ^2.0.0
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.agtonomy.connect_native_http
+        pluginClass: ConnectNativeHttpPlugin
+      ios:
+        pluginClass: ConnectNativeHttpPlugin

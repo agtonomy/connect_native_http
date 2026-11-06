@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Trusts the CA test_server writes on first start, which ../../../../run_integration_tests.sh copies to res/raw. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/test_server_ca" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

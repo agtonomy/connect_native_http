@@ -1,0 +1,26 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    depend_on_referenced_packages: error
+  exclude:
+    - "build/**"
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+    - "**/*.mocks.dart"
+    # Separate packages with their own options and dependencies.
+    - "example/**"
+    - "test_server/**"
+    - "android/**"
+    - "ios/**"
+
+linter:
+  rules:
+    directives_ordering: true
+    prefer_relative_imports: true
+    require_trailing_commas: true
+    library_private_types_in_public_api: false
+
+formatter:
+  page_width: 120
+  trailing_commas: preserve
