@@ -159,23 +159,7 @@ jobs:
         env:
           FLUTTER: flutter
           SUITES: native
-        run: |
-          # DEBUG: the step has hung after its tests pass. Report what still runs, and what holds tee's pipe open.
-          (
-            sleep 150
-            echo "=== watchdog: step still running after 150s"
-            ps -U "$USER" -o pid,ppid,pgid,etime,command
-            for pid in $(pgrep -x tee); do
-              echo "--- fds of tee $pid"
-              lsof -nP -p "$pid"
-              dev=$(lsof -nP -a -p "$pid" -d 0 | awk 'NR==2 {print $6}')
-              echo "--- every process on pipe $dev"
-              lsof -nP | grep -F "$dev"
-            done
-          ) &
-          watchdog=$!
-          trap 'kill $watchdog 2>/dev/null' EXIT
-          ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       - name: Upload logs
         if: always()
         timeout-minutes: 5

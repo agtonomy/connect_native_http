@@ -28,6 +28,16 @@ MAX_IDLE_SECONDS=3
 KEEPALIVE=1s
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_PID=""
+
+# Waits for the server's graceful shutdown, so a run started right after this one can bind the same ports. The server
+# shares this script's output, so one left running would also keep the log's tee, and whatever waits on it, open.
+stop_server() {
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null && wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+  fi
+}
 
 run() {
 case "$PLATFORM" in
@@ -67,8 +77,6 @@ fi
 "$ROOT/test_server/connect-native-http-test-server" -addr ":$PORT" -hosts "$HOSTS" \
   -certdir "$ROOT/test_server/certs" -admin-addr ":$ADMIN_PORT" -max-idle "${MAX_IDLE_SECONDS}s" -keepalive "$KEEPALIVE" &
 SERVER_PID=$!
-# Wait for the server's graceful shutdown, so a run started right after this one can bind the same ports.
-trap 'kill $SERVER_PID 2>/dev/null && wait $SERVER_PID 2>/dev/null || true' EXIT
 # The admin endpoint comes up after the certificates and both listeners, so it doubles as a readiness check.
 ready=0
 for _ in $(seq 50); do
@@ -132,7 +140,12 @@ if [[ " $SUITES " == *" native "* ]]; then
       ;;
   esac
 fi
+stop_server
 }
 
 mkdir -p "$ROOT/build"
-run 2>&1 | tee "$ROOT/build/integration_test_${PLATFORM}_${SUITES// /_}.log"
+# run executes in this shell, not in a pipeline's subshell, so the EXIT trap reliably stops the server. On a macOS
+# runner, a trap set inside `run | tee` once missed, and the orphaned server held tee open after the tests passed.
+exec > >(tee "$ROOT/build/integration_test_${PLATFORM}_${SUITES// /_}.log") 2>&1
+trap stop_server EXIT
+run
