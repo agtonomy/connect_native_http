@@ -13,6 +13,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Every job and every step has a timeout, a few times its usual duration, so a hung step fails on its own name instead
+# of using up the job's budget.
 jobs:
   dart:
     name: Dart format, analyze and unit tests
@@ -20,19 +22,26 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 5
       - name: Set up Flutter from .fvmrc
         uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+        timeout-minutes: 10
       - name: Get dependencies
+        timeout-minutes: 5
         run: |
           flutter pub get
           flutter pub get --directory example
       - name: Check formatting
+        timeout-minutes: 2
         run: dart format --output=none --set-exit-if-changed .
       - name: Analyze package
+        timeout-minutes: 5
         run: flutter analyze
       - name: Analyze example
+        timeout-minutes: 5
         run: flutter analyze example
       - name: Unit tests
+        timeout-minutes: 5
         run: flutter test
 
   test-server:
@@ -44,15 +53,20 @@ jobs:
         working-directory: test_server
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 5
       - uses: actions/setup-go@v7
+        timeout-minutes: 5
         with:
           go-version-file: test_server/go.mod
           cache-dependency-path: test_server/go.sum
       - name: Check formatting
+        timeout-minutes: 2
         run: test -z "$(gofmt -l . | tee /dev/stderr)"
       - name: Vet
+        timeout-minutes: 5
         run: go vet ./...
       - name: Test
+        timeout-minutes: 5
         run: go test ./...
 
   swift-core:
@@ -61,11 +75,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 5
       - uses: actions/setup-go@v7
+        timeout-minutes: 5
         with:
           go-version-file: test_server/go.mod
           cache-dependency-path: test_server/go.sum
       - name: Start test server
+        timeout-minutes: 5
         run: |
           cd test_server
           go build -o connect-native-http-test-server .
@@ -79,6 +96,7 @@ jobs:
           cat server.log >&2
           exit 1
       - name: Swift tests
+        timeout-minutes: 5
         working-directory: ios/connect_native_http
         env:
           CONNECT_NATIVE_HTTP_CORE_ONLY: "1"
@@ -87,6 +105,7 @@ jobs:
         run: swift test
       - name: Upload test server log
         if: failure()
+        timeout-minutes: 5
         uses: actions/upload-artifact@v7
         with:
           name: swift-core-server-log
@@ -98,16 +117,20 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 5
       - uses: actions/setup-go@v7
+        timeout-minutes: 5
         with:
           go-version-file: test_server/go.mod
           cache-dependency-path: test_server/go.sum
       - name: Set up Flutter from .fvmrc
         uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+        timeout-minutes: 10
         with:
           post-setup-script: flutter config --enable-swift-package-manager
       - name: Boot simulator
         id: simulator
+        timeout-minutes: 10
         run: |
           udid=$(xcrun simctl list devices available --json |
             jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
@@ -120,18 +143,21 @@ jobs:
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
           xcrun simctl bootstatus "$udid" -b
       - name: Dart integration tests
+        timeout-minutes: 15
         env:
           FLUTTER: flutter
           SUITES: dart
         run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       - name: Native bridge tests (XCTest)
         if: ${{ !cancelled() }}
+        timeout-minutes: 15
         env:
           FLUTTER: flutter
           SUITES: native
         run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       - name: Upload logs
         if: always()
+        timeout-minutes: 5
         uses: actions/upload-artifact@v7
         with:
           name: ios-integration-logs
@@ -141,28 +167,34 @@ jobs:
   android-integration:
     name: Android integration tests (emulator)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 5
       - name: Enable KVM
+        timeout-minutes: 2
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
             sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - uses: actions/setup-java@v6
+        timeout-minutes: 5
         with:
           distribution: temurin
           java-version: "17"
       - uses: actions/setup-go@v7
+        timeout-minutes: 5
         with:
           go-version-file: test_server/go.mod
           cache-dependency-path: test_server/go.sum
       - name: Set up Flutter from .fvmrc
         uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+        timeout-minutes: 10
       # The emulator only lives for this one step, so the Dart and native (instrumented) suites run as two commands
       # inside it, each logged to its own file.
       - name: Dart integration tests, then native bridge tests (instrumented)
+        timeout-minutes: 30
         uses: reactivecircus/android-emulator-runner@v2
         env:
           FLUTTER: flutter
@@ -171,11 +203,13 @@ jobs:
           target: google_apis
           arch: x86_64
           disable-animations: true
+          emulator-boot-timeout: 300
           script: |
             SUITES=dart ./run_integration_tests.sh android emulator-5554
             SUITES=native ./run_integration_tests.sh android emulator-5554
       - name: Upload logs
         if: always()
+        timeout-minutes: 5
         uses: actions/upload-artifact@v7
         with:
           name: android-integration-logs
@@ -197,6 +231,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check that every job succeeded
+        timeout-minutes: 2
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
