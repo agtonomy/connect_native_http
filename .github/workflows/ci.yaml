@@ -129,20 +129,22 @@ jobs:
             timeout-minutes: 10
             with:
               post-setup-script: flutter config --enable-swift-package-manager
-          - name: Boot simulator
-            id: simulator
-            timeout-minutes: 10
-            run: |
-              udid=$(xcrun simctl list devices available --json |
-                jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
-                  select(.name | startswith("iPhone"))] | last | .udid')
-              if [[ -z "$udid" || "$udid" == null ]]; then
-                xcrun simctl list devices available
-                echo "no iPhone simulator available" >&2
-                exit 1
-              fi
-              echo "udid=$udid" >> "$GITHUB_OUTPUT"
-              xcrun simctl bootstatus "$udid" -b
+      # Not in the group above: the simulator's first-boot data migration saturates the runner's disk, and in parallel
+      # it stalled the Flutter download to under 1 MB/s and timed out setup-go.
+      - name: Boot simulator
+        id: simulator
+        timeout-minutes: 10
+        run: |
+          udid=$(xcrun simctl list devices available --json |
+            jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
+              select(.name | startswith("iPhone"))] | last | .udid')
+          if [[ -z "$udid" || "$udid" == null ]]; then
+            xcrun simctl list devices available
+            echo "no iPhone simulator available" >&2
+            exit 1
+          fi
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl bootstatus "$udid" -b
       - name: Dart integration tests
         id: dart
         timeout-minutes: 15
