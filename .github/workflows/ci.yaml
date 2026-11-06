@@ -1,0 +1,225 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  dart:
+    name: Dart format, analyze and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Flutter from .fvmrc
+        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+      - name: Get dependencies
+        run: |
+          flutter pub get
+          flutter pub get --directory example
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed .
+      - name: Analyze package
+        run: flutter analyze
+      - name: Analyze example
+        run: flutter analyze example
+      - name: Unit tests
+        run: flutter test
+
+  test-server:
+    name: Go test server
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: test_server
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: test_server/go.mod
+          cache-dependency-path: test_server/go.sum
+      - name: Check formatting
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+
+  swift-core:
+    name: Swift core tests (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: test_server/go.mod
+          cache-dependency-path: test_server/go.sum
+      - name: Start test server
+        run: |
+          cd test_server
+          go build -o connect-native-http-test-server .
+          ./connect-native-http-test-server -addr :8443 -hosts localhost -certdir certs -admin-addr :8081 \
+            > server.log 2>&1 &
+          for _ in $(seq 100); do
+            if curl -sf -X POST http://localhost:8081/unfreeze >/dev/null; then exit 0; fi
+            sleep 0.1
+          done
+          echo "test server did not come up" >&2
+          cat server.log >&2
+          exit 1
+      - name: Swift tests
+        working-directory: ios/connect_native_http
+        env:
+          CONNECT_NATIVE_HTTP_CORE_ONLY: "1"
+          SERVER_URL: https://localhost:8443
+          SERVER_CA: ${{ github.workspace }}/test_server/certs/ca.der
+        run: swift test
+      - name: Upload test server log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-core-server-log
+          path: test_server/server.log
+
+  android-build:
+    name: Android example build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up Flutter from .fvmrc
+        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+      - name: Build debug APK
+        working-directory: example
+        run: flutter build apk --debug
+
+  ios-integration:
+    name: iOS integration tests (simulator)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: test_server/go.mod
+          cache-dependency-path: test_server/go.sum
+      - name: Set up Flutter from .fvmrc
+        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+        with:
+          post-setup-script: flutter config --enable-swift-package-manager
+      - name: Boot simulator
+        id: simulator
+        run: |
+          udid=$(xcrun simctl list devices available --json |
+            jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
+              select(.name | startswith("iPhone"))] | last | .udid')
+          if [[ -z "$udid" || "$udid" == null ]]; then
+            xcrun simctl list devices available
+            echo "no iPhone simulator available" >&2
+            exit 1
+          fi
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl bootstatus "$udid" -b
+      - name: Dart integration tests
+        env:
+          FLUTTER: flutter
+          SUITES: dart
+        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+      - name: Native bridge tests (XCTest)
+        if: ${{ !cancelled() }}
+        env:
+          FLUTTER: flutter
+          SUITES: native
+        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-integration-logs
+          path: build/integration_test_*.log
+          if-no-files-found: ignore
+
+  android-integration:
+    name: Android integration tests (emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: test_server/go.mod
+          cache-dependency-path: test_server/go.sum
+      - name: Set up Flutter from .fvmrc
+        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+      # The emulator only lives for this one step, so the Dart and native (instrumented) suites run as two commands
+      # inside it, each logged to its own file.
+      - name: Dart integration tests, then native bridge tests (instrumented)
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          FLUTTER: flutter
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: |
+            SUITES=dart ./run_integration_tests.sh android emulator-5554
+            SUITES=native ./run_integration_tests.sh android emulator-5554
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-integration-logs
+          path: build/integration_test_*.log
+          if-no-files-found: ignore
+
+  # The one check to mark as required. It runs even when a job it needs fails, so it reports failure instead of
+  # being skipped, which branch protection would count as passing.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs:
+      - dart
+      - test-server
+      - swift-core
+      - android-build
+      - ios-integration
+      - android-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check that every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            if [[ "$result" != success ]]; then
+              exit 1
+            fi
+          done

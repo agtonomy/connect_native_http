@@ -6,18 +6,21 @@
 #   ./run_integration_tests.sh android <adb serial, e.g. emulator-5554>
 #   ./run_integration_tests.sh ios <udid> --plain-name 'bidi'   # extra arguments go to `flutter test`
 #   SUITES=native ./run_integration_tests.sh ios <udid>         # only the native tests; SUITES=dart for only Dart
+#   FLUTTER=flutter ./run_integration_tests.sh ios <udid>       # use the flutter on PATH instead of `fvm flutter`
 #
 # iOS: the server's CA goes into the simulator's keychain, and calls should go over HTTP/3.
 # Android: the CA is bundled into the example app. Cronet only uses QUIC with public roots, so this checks HTTP/2;
 # HTTP/3 on Android needs a server with a publicly trusted certificate.
 #
-# Output goes to the terminal and to build/integration_test.log.
+# Output goes to the terminal and to build/integration_test_<platform>_<suites>.log.
 set -euo pipefail
 
 PLATFORM="${1:?usage: $0 ios|android <device id> [flutter test args]}"
 DEVICE="${2:?usage: $0 ios|android <device id> [flutter test args]}"
 EXTRA_ARGS=("${@:3}")
 SUITES="${SUITES:-dart native}"
+# Split on spaces, so the default runs as `fvm flutter`.
+read -ra FLUTTER <<< "${FLUTTER:-fvm flutter}"
 PORT=8443
 ADMIN_PORT=8081
 # Short QUIC settings so the idle-timeout tests take seconds, not the server's 30 s default.
@@ -93,7 +96,7 @@ esac
 cd "$ROOT/example"
 if [[ " $SUITES " == *" dart "* ]]; then
   echo "Dart integration tests"
-  fvm flutter test integration_test -d "$DEVICE" \
+  "${FLUTTER[@]}" test integration_test -d "$DEVICE" \
     --dart-define=SERVER_URL="$SERVER_URL" \
     --dart-define=UNTRUSTED_URL="$UNTRUSTED_URL" \
     --dart-define=UNREACHABLE_URL="$UNREACHABLE_URL" \
@@ -123,7 +126,7 @@ if [[ " $SUITES " == *" native "* ]]; then
       # plugin. Flutter writes example/android/gradlew.
       mkdir -p "$ROOT/android/src/androidTest/res/raw"
       cp "$ROOT/test_server/certs/ca.pem" "$ROOT/android/src/androidTest/res/raw/test_server_ca.pem"
-      fvm flutter build apk --debug --config-only
+      "${FLUTTER[@]}" build apk --debug --config-only
       (cd android && ANDROID_SERIAL="$DEVICE" ./gradlew :connect_native_http:connectedDebugAndroidTest \
         -Pandroid.testInstrumentationRunnerArguments.serverUrl="$SERVER_URL")
       ;;
@@ -132,4 +135,4 @@ fi
 }
 
 mkdir -p "$ROOT/build"
-run 2>&1 | tee "$ROOT/build/integration_test.log"
+run 2>&1 | tee "$ROOT/build/integration_test_${PLATFORM}_${SUITES// /_}.log"
