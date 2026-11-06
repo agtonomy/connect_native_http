@@ -118,19 +118,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
-      - uses: actions/setup-go@v7
-        timeout-minutes: 5
-        with:
-          go-version-file: test_server/go.mod
-          cache-dependency-path: test_server/go.sum
-      - name: Set up Flutter from .fvmrc
-        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
-        timeout-minutes: 10
-        with:
-          post-setup-script: flutter config --enable-swift-package-manager
-      - name: Boot simulator
+      # Boots in the background while the toolchains are set up; "Wait for simulator" joins it.
+      - name: Start simulator
         id: simulator
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
           udid=$(xcrun simctl list devices available --json |
             jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
@@ -141,7 +132,20 @@ jobs:
             exit 1
           fi
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
-          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl boot "$udid"
+      - uses: actions/setup-go@v7
+        timeout-minutes: 5
+        with:
+          go-version-file: test_server/go.mod
+          cache-dependency-path: test_server/go.sum
+      - name: Set up Flutter from .fvmrc
+        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+        timeout-minutes: 10
+        with:
+          post-setup-script: flutter config --enable-swift-package-manager
+      - name: Wait for simulator
+        timeout-minutes: 10
+        run: xcrun simctl bootstatus "${{ steps.simulator.outputs.udid }}"
       - name: Dart integration tests
         timeout-minutes: 15
         env:
@@ -154,7 +158,23 @@ jobs:
         env:
           FLUTTER: flutter
           SUITES: native
-        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+        run: |
+          # DEBUG: the step has hung after its tests pass. Report what still runs, and what holds tee's pipe open.
+          (
+            sleep 150
+            echo "=== watchdog: step still running after 150s"
+            ps -U "$USER" -o pid,ppid,pgid,etime,command
+            for pid in $(pgrep -x tee); do
+              echo "--- fds of tee $pid"
+              lsof -nP -p "$pid"
+              dev=$(lsof -nP -a -p "$pid" -d 0 | awk 'NR==2 {print $6}')
+              echo "--- every process on pipe $dev"
+              lsof -nP | grep -F "$dev"
+            done
+          ) &
+          watchdog=$!
+          trap 'kill $watchdog 2>/dev/null' EXIT
+          ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       - name: Upload logs
         if: always()
         timeout-minutes: 5
@@ -168,6 +188,8 @@ jobs:
     name: Android integration tests (emulator)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      ANDROID_API_LEVEL: 34
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -185,11 +207,32 @@ jobs:
             sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      - name: Cache emulator system image
+        uses: actions/cache@v6
+        timeout-minutes: 5
+        with:
+          path: /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API_LEVEL }}
+          key: android-system-image-${{ env.ANDROID_API_LEVEL }}-google_apis-x86_64
+      # Boots in the background while the app builds; "Wait for emulator" joins it. Two of the runner's four cores go
+      # to the emulator and the rest to Gradle.
+      - name: Start emulator
+        timeout-minutes: 5
+        run: |
+          image="system-images;android-$ANDROID_API_LEVEL;google_apis;x86_64"
+          tools="$ANDROID_HOME/cmdline-tools/latest/bin"
+          yes | "$tools/sdkmanager" --licenses > /dev/null
+          "$tools/sdkmanager" --install emulator "$image" > /dev/null
+          echo no | "$tools/avdmanager" create avd --force -n ci -k "$image"
+          printf 'hw.cpu.ncore=2\ndisk.dataPartition.size=4096M\n' >> ~/.android/avd/ci.avd/config.ini
+          nohup "$ANDROID_HOME/emulator/emulator" -avd ci -port 5554 -no-window -gpu swiftshader_indirect \
+            -no-snapshot -noaudio -no-boot-anim -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/emulator.pid"
       - uses: actions/setup-java@v6
         timeout-minutes: 5
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
       - uses: actions/setup-go@v7
         timeout-minutes: 5
         with:
@@ -198,30 +241,70 @@ jobs:
       - name: Set up Flutter from .fvmrc
         uses: kuhnroyal/flutter-fvm-config-action/setup@v3
         timeout-minutes: 10
-      # The emulator only lives for this one step, so the Dart and native (instrumented) suites run as two commands
-      # inside it, each logged to its own file.
-      - name: Dart integration tests, then native bridge tests (instrumented)
-        timeout-minutes: 30
-        uses: reactivecircus/android-emulator-runner@v2
+      # Both APKs trust the test server's CA from res/raw, so it must exist to build them. The server creates it on
+      # first start and reuses it after, so the CA built in here is the one the tests' server uses.
+      - name: Generate test server CA
+        timeout-minutes: 5
+        run: |
+          (cd test_server && go build -o connect-native-http-test-server .)
+          test_server/connect-native-http-test-server -addr :8443 -hosts 10.0.2.2.nip.io -certdir test_server/certs \
+            -admin-addr :8081 &
+          server=$!
+          for _ in $(seq 100); do
+            if curl -sf -X POST http://localhost:8081/unfreeze >/dev/null; then break; fi
+            sleep 0.1
+          done
+          kill "$server"
+          wait "$server" || true
+          for dir in example/android/app/src/main/res/raw android/src/androidTest/res/raw; do
+            mkdir -p "$dir"
+            cp test_server/certs/ca.pem "$dir/test_server_ca.pem"
+          done
+      - name: Build example app
+        timeout-minutes: 15
+        working-directory: example
+        run: flutter build apk --debug
+      - name: Build plugin instrumented tests
+        timeout-minutes: 10
+        working-directory: example/android
+        run: ./gradlew :connect_native_http:assembleDebugAndroidTest
+      - name: Wait for emulator
+        timeout-minutes: 5
+        run: |
+          adb="$ANDROID_HOME/platform-tools/adb"
+          until [[ "$("$adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]]; do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/emulator.pid")" 2>/dev/null; then
+              echo "emulator exited:" >&2
+              tail -50 "$RUNNER_TEMP/emulator.log" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          for setting in window_animation_scale transition_animation_scale animator_duration_scale; do
+            "$adb" -s emulator-5554 shell settings put global "$setting" 0
+          done
+      - name: Dart integration tests
+        timeout-minutes: 15
         env:
           FLUTTER: flutter
-        with:
-          api-level: 34
-          target: google_apis
-          arch: x86_64
-          disable-animations: true
-          disk-size: 4096M
-          emulator-boot-timeout: 300
-          script: |
-            SUITES=dart ./run_integration_tests.sh android emulator-5554
-            SUITES=native ./run_integration_tests.sh android emulator-5554
+          SUITES: dart
+        run: ./run_integration_tests.sh android emulator-5554
+      - name: Native bridge tests (instrumented)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          FLUTTER: flutter
+          SUITES: native
+        run: ./run_integration_tests.sh android emulator-5554
       - name: Upload logs
         if: always()
         timeout-minutes: 5
         uses: actions/upload-artifact@v7
         with:
           name: android-integration-logs
-          path: build/integration_test_*.log
+          path: |
+            build/integration_test_*.log
+            ${{ runner.temp }}/emulator.log
           if-no-files-found: ignore
 
   # The one check to mark as required. It runs even when a job it needs fails, so it reports failure instead of

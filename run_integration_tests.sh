@@ -17,6 +17,7 @@ set -euo pipefail
 
 PLATFORM="${1:?usage: $0 ios|android <device id> [flutter test args]}"
 DEVICE="${2:?usage: $0 ios|android <device id> [flutter test args]}"
+# Expanded as ${EXTRA_ARGS[@]+...} below: macOS's bash 3.2 treats an empty array as unbound under `set -u`.
 EXTRA_ARGS=("${@:3}")
 SUITES="${SUITES:-dart native}"
 # Split on spaces, so the default runs as `fvm flutter`.
@@ -103,7 +104,7 @@ if [[ " $SUITES " == *" dart "* ]]; then
     --dart-define=EXPECT_PROTOCOL="$EXPECT_PROTOCOL" \
     --dart-define=ADMIN_URL="$ADMIN_URL" \
     --dart-define=SERVER_MAX_IDLE_SECONDS="$MAX_IDLE_SECONDS" \
-    "${EXTRA_ARGS[@]}"
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 fi
 if [[ " $SUITES " == *" native "* ]]; then
   echo "Native plugin tests"
