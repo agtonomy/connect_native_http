@@ -118,44 +118,41 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
-      # Boots in the background while the toolchains are set up; "Wait for simulator" joins it.
-      - name: Start simulator
-        id: simulator
-        timeout-minutes: 5
-        run: |
-          udid=$(xcrun simctl list devices available --json |
-            jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
-              select(.name | startswith("iPhone"))] | last | .udid')
-          if [[ -z "$udid" || "$udid" == null ]]; then
-            xcrun simctl list devices available
-            echo "no iPhone simulator available" >&2
-            exit 1
-          fi
-          echo "udid=$udid" >> "$GITHUB_OUTPUT"
-          xcrun simctl boot "$udid"
-      - uses: actions/setup-go@v7
-        timeout-minutes: 5
-        with:
-          go-version-file: test_server/go.mod
-          cache-dependency-path: test_server/go.sum
-      - name: Set up Flutter from .fvmrc
-        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
-        timeout-minutes: 10
-        with:
-          post-setup-script: flutter config --enable-swift-package-manager
-      - name: Wait for simulator
-        id: wait-simulator
-        timeout-minutes: 10
-        run: xcrun simctl bootstatus "${{ steps.simulator.outputs.udid }}"
+      - parallel:
+          - uses: actions/setup-go@v7
+            timeout-minutes: 5
+            with:
+              go-version-file: test_server/go.mod
+              cache-dependency-path: test_server/go.sum
+          - name: Set up Flutter from .fvmrc
+            uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+            timeout-minutes: 10
+            with:
+              post-setup-script: flutter config --enable-swift-package-manager
+          - name: Boot simulator
+            id: simulator
+            timeout-minutes: 10
+            run: |
+              udid=$(xcrun simctl list devices available --json |
+                jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
+                  select(.name | startswith("iPhone"))] | last | .udid')
+              if [[ -z "$udid" || "$udid" == null ]]; then
+                xcrun simctl list devices available
+                echo "no iPhone simulator available" >&2
+                exit 1
+              fi
+              echo "udid=$udid" >> "$GITHUB_OUTPUT"
+              xcrun simctl bootstatus "$udid" -b
       - name: Dart integration tests
+        id: dart
         timeout-minutes: 15
         env:
           FLUTTER: flutter
           SUITES: dart
         run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
-      # Runs after a failed Dart suite too, but not when the simulator never came up.
+      # Runs after a failed Dart suite too, but not when setup failed and the Dart suite never ran.
       - name: Native bridge tests (XCTest)
-        if: ${{ !cancelled() && steps.wait-simulator.outcome == 'success' }}
+        if: ${{ !cancelled() && (steps.dart.outcome == 'success' || steps.dart.outcome == 'failure') }}
         timeout-minutes: 15
         env:
           FLUTTER: flutter
@@ -197,56 +194,58 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
-      # The emulator needs several GB free for its userdata partition, more than some runners have left by default.
-      - name: Free disk space
-        timeout-minutes: 5
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          df -h /
-      - name: Enable KVM
-        timeout-minutes: 2
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
-            sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Cache emulator system image
-        uses: actions/cache@v6
-        timeout-minutes: 5
-        with:
-          path: /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API_LEVEL }}
-          key: android-system-image-${{ env.ANDROID_API_LEVEL }}-google_apis-x86_64
-      # Boots in the background while the app builds; "Wait for emulator" joins it. Two of the runner's four cores go
-      # to the emulator and the rest to Gradle.
-      - name: Start emulator
-        timeout-minutes: 5
-        run: |
-          image="system-images;android-$ANDROID_API_LEVEL;google_apis;x86_64"
-          tools="$ANDROID_HOME/cmdline-tools/latest/bin"
-          yes | "$tools/sdkmanager" --licenses > /dev/null
-          "$tools/sdkmanager" --install emulator "$image" > /dev/null
-          mkdir -p "$ANDROID_AVD_HOME"
-          echo no | "$tools/avdmanager" create avd --force -n ci -k "$image"
-          "$tools/avdmanager" list avd
-          printf 'hw.cpu.ncore=2\ndisk.dataPartition.size=4096M\n' >> "$ANDROID_AVD_HOME/ci.avd/config.ini"
-          nohup "$ANDROID_HOME/emulator/emulator" -avd ci -port 5554 -no-window -gpu swiftshader_indirect \
-            -no-snapshot -noaudio -no-boot-anim -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 &
-          echo "$!" > "$RUNNER_TEMP/emulator.pid"
-      - uses: actions/setup-java@v6
-        timeout-minutes: 5
-        with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
-      - uses: actions/setup-go@v7
-        timeout-minutes: 5
-        with:
-          go-version-file: test_server/go.mod
-          cache-dependency-path: test_server/go.sum
-      - name: Set up Flutter from .fvmrc
-        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
-        timeout-minutes: 10
+      - parallel:
+          # The emulator needs several GB free for its userdata partition, more than some runners have left.
+          - name: Free disk space
+            timeout-minutes: 5
+            run: |
+              df -h /
+              sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+              df -h /
+          - name: Enable KVM
+            timeout-minutes: 2
+            run: |
+              echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+                sudo tee /etc/udev/rules.d/99-kvm4all.rules
+              sudo udevadm control --reload-rules
+              sudo udevadm trigger --name-match=kvm
+          - name: Cache emulator system image
+            uses: actions/cache@v6
+            timeout-minutes: 5
+            with:
+              path: /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API_LEVEL }}
+              key: android-system-image-${{ env.ANDROID_API_LEVEL }}-google_apis-x86_64
+      - parallel:
+          # Leaves the emulator booting in the background, through the builds below; "Wait for emulator" joins it.
+          # Two of the runner's four cores go to the emulator and the rest to Gradle.
+          - name: Start emulator
+            timeout-minutes: 5
+            run: |
+              image="system-images;android-$ANDROID_API_LEVEL;google_apis;x86_64"
+              tools="$ANDROID_HOME/cmdline-tools/latest/bin"
+              yes | "$tools/sdkmanager" --licenses > /dev/null
+              "$tools/sdkmanager" --install emulator "$image" > /dev/null
+              mkdir -p "$ANDROID_AVD_HOME"
+              echo no | "$tools/avdmanager" create avd --force -n ci -k "$image"
+              "$tools/avdmanager" list avd
+              printf 'hw.cpu.ncore=2\ndisk.dataPartition.size=4096M\n' >> "$ANDROID_AVD_HOME/ci.avd/config.ini"
+              nohup "$ANDROID_HOME/emulator/emulator" -avd ci -port 5554 -no-window -gpu swiftshader_indirect \
+                -no-snapshot -noaudio -no-boot-anim -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 &
+              echo "$!" > "$RUNNER_TEMP/emulator.pid"
+          - uses: actions/setup-java@v6
+            timeout-minutes: 5
+            with:
+              distribution: temurin
+              java-version: "17"
+              cache: gradle
+          - uses: actions/setup-go@v7
+            timeout-minutes: 5
+            with:
+              go-version-file: test_server/go.mod
+              cache-dependency-path: test_server/go.sum
+          - name: Set up Flutter from .fvmrc
+            uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+            timeout-minutes: 10
       # Both APKs trust the test server's CA from res/raw, so it must exist to build them. The server creates it on
       # first start and reuses it after, so the CA built in here is the one the tests' server uses.
       - name: Generate test server CA

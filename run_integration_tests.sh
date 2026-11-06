@@ -6,8 +6,7 @@
 #   ./run_integration_tests.sh android <adb serial, e.g. emulator-5554>
 #   ./run_integration_tests.sh ios <udid> --plain-name 'bidi'   # extra arguments go to `flutter test`
 #   SUITES=native ./run_integration_tests.sh ios <udid>         # only the native tests; SUITES=dart for only Dart
-#   FLUTTER=flutter ./run_integration_tests.sh ios <udid>       # use the flutter on PATH instead of `fvm flutter`
-#
+#   FLUTTER=flutter ./run_integration_tests.sh ios <udid>       # use the flutter on PATH instead of `fvm flutter`#
 # iOS: the server's CA goes into the simulator's keychain, and calls should go over HTTP/3.
 # Android: the CA is bundled into the example app. Cronet only uses QUIC with public roots, so this checks HTTP/2;
 # HTTP/3 on Android needs a server with a publicly trusted certificate.
