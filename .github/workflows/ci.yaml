@@ -171,6 +171,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
+      # The emulator needs several GB free for its userdata partition, more than some runners have left by default.
+      - name: Free disk space
+        timeout-minutes: 5
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
       - name: Enable KVM
         timeout-minutes: 2
         run: |
@@ -203,6 +210,7 @@ jobs:
           target: google_apis
           arch: x86_64
           disable-animations: true
+          disk-size: 4096M
           emulator-boot-timeout: 300
           script: |
             SUITES=dart ./run_integration_tests.sh android emulator-5554
