@@ -65,8 +65,8 @@ final class Harness {
   void recordHeaders(Headers headers) => serverProtocols.add(headers.get('x-proto')?.join(',') ?? '');
 }
 
-/// Every case finishes in a few seconds against a local server; a hang should fail fast, not after 10 minutes.
-void testCase(String description, WidgetTesterCallback body, {Duration timeout = const Duration(seconds: 20)}) =>
+/// Every case finishes in a few seconds against a local server (most well under one); a hang should fail fast.
+void testCase(String description, WidgetTesterCallback body, {Duration timeout = const Duration(seconds: 10)}) =>
     testWidgets(description, body, timeout: Timeout(timeout));
 
 Future<void> admin(String path) async {
@@ -95,7 +95,7 @@ Future<(StreamController<ConverseRequest>, StreamIterator<ConverseResponse>)> op
 /// device a connection sometimes lands on HTTP/2 even for an HTTP/3 origin. A client keeps reusing the connection it
 /// has, so each attempt uses a fresh client, closing the ones that got HTTP/2.
 Future<Harness> harnessOverHttp3() async {
-  final deadline = DateTime.now().add(const Duration(seconds: 8));
+  final deadline = DateTime.now().add(const Duration(seconds: 5));
   final protocols = <String>[];
   while (true) {
     final harness = await Harness.create(serverUrl, http3Origins: {Uri.parse(serverUrl)});
@@ -228,7 +228,7 @@ void main() {
       return;
     }
     // URLSession only moves to HTTP/3 on a new connection after an Alt-Svc response, so keep calling for a while.
-    final deadline = DateTime.now().add(const Duration(seconds: 15));
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
     while (DateTime.now().isBefore(deadline) && !harness.serverProtocols.contains(expectedProtocol)) {
       await harness.eliza.say(SayRequest(sentence: 'which protocol'), onHeader: harness.recordHeaders);
       await Future<void>.delayed(const Duration(milliseconds: 500));
@@ -260,8 +260,8 @@ void main() {
     return false;
   }
 
-  // Up to 8 s of harnessOverHttp3 on top of the case itself.
-  const http3CaseTimeout = Duration(seconds: 30);
+  // Up to 5 s of harnessOverHttp3 on top of the case itself, which waits up to 7 s for the idle timeout.
+  const http3CaseTimeout = Duration(seconds: 20);
 
   testCase('a quiet HTTP/3 stream outlives the idle timeout while the server pings', (_) async {
     if (skipUnlessHttp3()) {
@@ -287,7 +287,7 @@ void main() {
     final hold = serverMaxIdle * 2 + const Duration(seconds: 1);
     final res = await h3.eliza.say(
       SayRequest(sentence: 'sleep:${hold.inMilliseconds}'),
-      signal: TimeoutSignal(const Duration(seconds: 15)),
+      signal: TimeoutSignal(const Duration(seconds: 10)),
       onHeader: h3.recordHeaders,
     );
     expect(res.sentence, 'say: sleep:${hold.inMilliseconds}');

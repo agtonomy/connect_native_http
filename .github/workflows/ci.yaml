@@ -19,7 +19,7 @@ jobs:
   dart:
     name: Dart format, analyze and unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -47,7 +47,7 @@ jobs:
   test-server:
     name: Go test server
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: test_server
@@ -72,7 +72,7 @@ jobs:
   swift-core:
     name: Swift core tests (macOS)
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -114,7 +114,7 @@ jobs:
   ios-integration:
     name: iOS integration tests (simulator)
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -138,18 +138,18 @@ jobs:
               cache-dependency-path: test_server/go.sum
           - name: Set up Flutter from .fvmrc
             uses: kuhnroyal/flutter-fvm-config-action/setup@v3
-            timeout-minutes: 10
+            timeout-minutes: 6
             with:
               post-setup-script: flutter config --enable-swift-package-manager
           # Needs neither Go nor Flutter, nor a booted simulator; the native step then finds it up to date.
           - name: Build native bridge tests
-            timeout-minutes: 10
+            timeout-minutes: 6
             run: ios/connect_native_http/build_core_tests.sh build/ios_core_tests
       # Not in the group above: the simulator's first-boot data migration saturates the runner's disk, and in parallel
       # it stalled the Flutter download to under 1 MB/s and timed out setup-go.
       - name: Boot simulator
         id: simulator
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
           udid=$(xcrun simctl list devices available --json |
             jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
@@ -173,7 +173,7 @@ jobs:
       # suite stalled before the TLS handshake on every run, and passed when the suite ran again.
       - name: Native bridge tests (XCTest)
         id: native
-        timeout-minutes: 15
+        timeout-minutes: 5
         env:
           FLUTTER: flutter
           SUITES: native
@@ -182,15 +182,17 @@ jobs:
       # Runs after a failed native suite too, but not when setup failed and the native suite never ran.
       - name: Dart integration tests
         if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
-        timeout-minutes: 15
+        timeout-minutes: 10
         env:
           FLUTTER: flutter
           SUITES: dart
           QLOGDIR: ${{ runner.temp }}/qlog/dart
-        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+        # DEBUG -v: flutter test once launched the app and then waited 13 minutes without connecting to it; verbose
+        # output shows what it waits on.
+        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}" -v
       - name: Upload logs
         if: always()
-        timeout-minutes: 5
+        timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
           name: ios-integration-logs
@@ -203,7 +205,7 @@ jobs:
   android-integration:
     name: Android integration tests (emulator)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     env:
       ANDROID_API_LEVEL: 34
       # Set explicitly, so avdmanager, the config edit below and the emulator all use the same directory.
@@ -292,11 +294,11 @@ jobs:
             cp test_server/certs/ca.pem "$dir/test_server_ca.pem"
           done
       - name: Build example app
-        timeout-minutes: 15
+        timeout-minutes: 8
         working-directory: example
         run: flutter build apk --debug
       - name: Build plugin instrumented tests
-        timeout-minutes: 10
+        timeout-minutes: 4
         working-directory: example/android
         run: ./gradlew :connect_native_http:assembleDebugAndroidTest
       - name: Wait for emulator
@@ -316,7 +318,7 @@ jobs:
             "$adb" -s emulator-5554 shell settings put global "$setting" 0
           done
       - name: Dart integration tests
-        timeout-minutes: 15
+        timeout-minutes: 8
         env:
           FLUTTER: flutter
           SUITES: dart
@@ -324,14 +326,14 @@ jobs:
       # Runs after a failed Dart suite too, but not when the emulator never came up.
       - name: Native bridge tests (instrumented)
         if: ${{ !cancelled() && steps.emulator.outcome == 'success' }}
-        timeout-minutes: 15
+        timeout-minutes: 5
         env:
           FLUTTER: flutter
           SUITES: native
         run: ./run_integration_tests.sh android emulator-5554
       - name: Upload logs
         if: always()
-        timeout-minutes: 5
+        timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
           name: android-integration-logs

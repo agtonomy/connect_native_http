@@ -39,6 +39,37 @@ stop_server() {
   fi
 }
 
+# Kills a process and everything it started: a flutter or gradle left without its parent keeps writing to, and holding
+# open, this script's output.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1"); do
+    kill_tree "$child"
+  done
+  kill "$1" 2>/dev/null || true
+}
+
+# Runs a command and kills it once it has run for the given seconds, so a hang (an app that never launches, a stuck
+# build) fails fast and says what hung; macOS has no timeout(1). The watchdog's sleep writes nowhere, so even a sleep
+# left behind can't hold this script's output, and the log's tee, open.
+with_timeout() {
+  local limit=$1
+  shift
+  "$@" &
+  local pid=$!
+  (
+    sleep "$limit" > /dev/null 2>&1
+    echo "timed out after ${limit}s: $*" >&2
+    kill_tree "$pid"
+  ) &
+  local watchdog=$!
+  local status=0
+  wait "$pid" || status=$?
+  kill "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null || true
+  return "$status"
+}
+
 run() {
 case "$PLATFORM" in
   ios)
@@ -67,7 +98,7 @@ case "$PLATFORM" in
 esac
 
 echo "Building the test server"
-(cd "$ROOT/test_server" && go build -o connect-native-http-test-server .)
+with_timeout 120 go -C "$ROOT/test_server" build -o connect-native-http-test-server .
 
 # A server left over from an earlier run would hold the ports, make this one exit, and answer in its place.
 if curl -s -o /dev/null "http://localhost:$ADMIN_PORT/"; then
@@ -93,7 +124,7 @@ fi
 
 case "$PLATFORM" in
   ios)
-    xcrun simctl keychain "$DEVICE" add-root-cert "$ROOT/test_server/certs/ca.pem"
+    with_timeout 30 xcrun simctl keychain "$DEVICE" add-root-cert "$ROOT/test_server/certs/ca.pem"
     ;;
   android)
     mkdir -p "$ROOT/example/android/app/src/main/res/raw"
@@ -104,7 +135,9 @@ esac
 cd "$ROOT/example"
 if [[ " $SUITES " == *" dart "* ]]; then
   echo "Dart integration tests"
-  "${FLUTTER[@]}" test integration_test -d "$DEVICE" \
+  # Builds and launches the app once per test file, then runs it: about a minute when warm, a few cold. Each case
+  # has its own, shorter timeout; this one catches an app that never launches or never connects.
+  with_timeout 480 "${FLUTTER[@]}" test integration_test -d "$DEVICE" \
     --dart-define=SERVER_URL="$SERVER_URL" \
     --dart-define=UNTRUSTED_URL="$UNTRUSTED_URL" \
     --dart-define=UNREACHABLE_URL="$UNREACHABLE_URL" \
@@ -120,8 +153,9 @@ if [[ " $SUITES " == *" native "* ]]; then
       # The Flutter-free core's package tests, run on the simulator by xctest directly, which skips xcodebuild's test
       # session and result bundle. SIMCTL_CHILD_ variables reach the tests without the prefix. The build is a no-op
       # when CI has already run it.
-      "$ROOT/ios/connect_native_http/build_core_tests.sh" "$ROOT/build/ios_core_tests"
-      SIMCTL_CHILD_SERVER_URL="$SERVER_URL" SIMCTL_CHILD_SERVER_CA="$ROOT/test_server/certs/ca.der" \
+      with_timeout 300 "$ROOT/ios/connect_native_http/build_core_tests.sh" "$ROOT/build/ios_core_tests"
+      # The tests take about a second.
+      with_timeout 60 env SIMCTL_CHILD_SERVER_URL="$SERVER_URL" SIMCTL_CHILD_SERVER_CA="$ROOT/test_server/certs/ca.der" \
         xcrun simctl spawn "$DEVICE" \
         "$(xcrun --sdk iphonesimulator --show-sdk-platform-path)/Developer/Library/Xcode/Agents/xctest" \
         "$ROOT/build/ios_core_tests/Build/Products/Debug-iphonesimulator/ConnectNativeHttpCoreTests.xctest"
@@ -131,9 +165,10 @@ if [[ " $SUITES " == *" native "* ]]; then
       # plugin. Flutter writes example/android/gradlew.
       mkdir -p "$ROOT/android/src/androidTest/res/raw"
       cp "$ROOT/test_server/certs/ca.pem" "$ROOT/android/src/androidTest/res/raw/test_server_ca.pem"
-      "${FLUTTER[@]}" build apk --debug --config-only
-      (cd android && ANDROID_SERIAL="$DEVICE" ./gradlew :connect_native_http:connectedDebugAndroidTest \
-        -Pandroid.testInstrumentationRunnerArguments.serverUrl="$SERVER_URL")
+      with_timeout 120 "${FLUTTER[@]}" build apk --debug --config-only
+      with_timeout 300 env ANDROID_SERIAL="$DEVICE" android/gradlew -p android \
+        :connect_native_http:connectedDebugAndroidTest \
+        -Pandroid.testInstrumentationRunnerArguments.serverUrl="$SERVER_URL"
       ;;
   esac
 fi
