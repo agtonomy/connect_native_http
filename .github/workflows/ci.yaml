@@ -145,6 +145,13 @@ jobs:
           fi
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
           xcrun simctl bootstatus "$udid" -b
+      # DEBUG: the first few Dart cases time out before the TLS ClientHello. Record what the app's network stack does.
+      - name: "DEBUG: stream simulator network logs"
+        timeout-minutes: 2
+        run: |
+          nohup xcrun simctl spawn "${{ steps.simulator.outputs.udid }}" log stream --level debug --style compact \
+            --predicate 'process == "Runner" AND (subsystem == "com.apple.network" OR subsystem == "com.apple.CFNetwork")' \
+            > "$RUNNER_TEMP/sim-network.log" 2>&1 &
       - name: Dart integration tests
         id: dart
         timeout-minutes: 15
@@ -152,6 +159,17 @@ jobs:
           FLUTTER: flutter
           SUITES: dart
         run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+      # DEBUG: if the same cases pass on a second run, the failures come from a freshly booted simulator.
+      - name: "DEBUG: Dart integration tests again"
+        if: ${{ !cancelled() && (steps.dart.outcome == 'success' || steps.dart.outcome == 'failure') }}
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          FLUTTER: flutter
+          SUITES: dart
+        run: |
+          pkill -f 'log stream' || true
+          ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       # Runs after a failed Dart suite too, but not when setup failed and the Dart suite never ran.
       - name: Native bridge tests (XCTest)
         if: ${{ !cancelled() && (steps.dart.outcome == 'success' || steps.dart.outcome == 'failure') }}
@@ -166,7 +184,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ios-integration-logs
-          path: build/integration_test_*.log
+          path: |
+            build/integration_test_*.log
+            ${{ runner.temp }}/sim-network.log
           if-no-files-found: ignore
 
   android-integration:
