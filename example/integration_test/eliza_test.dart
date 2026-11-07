@@ -240,6 +240,17 @@ void main() {
     );
   });
 
+  testCase('the first call to an HTTP/3 origin goes over HTTP/3', (_) async {
+    if (expectedProtocol != 'HTTP/3.0') {
+      markTestSkipped('needs EXPECT_PROTOCOL=HTTP/3.0');
+      return;
+    }
+    // The origin is in http3Origins, so the client tries QUIC from its first connection. Real networks can block or
+    // slow QUIC and fall back to TCP, but on this local path a fallback means something is wrong.
+    await harness.eliza.say(SayRequest(sentence: 'first'), onHeader: harness.recordHeaders);
+    expect(harness.serverProtocols.single, 'HTTP/3.0', reason: 'the first connection fell back to TCP');
+  });
+
   // The idle-timeout cases freeze the server's UDP path, so they only apply where calls go over HTTP/3.
   bool skipUnlessHttp3() {
     if (expectedProtocol != 'HTTP/3.0' || adminUrl.isEmpty || serverMaxIdle == Duration.zero) {

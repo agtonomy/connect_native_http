@@ -31,6 +31,7 @@ import (
 	"connectrpc.com/connect/v2/connecthttp"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/qlog"
 
 	"connectnativehttp/testserver/gen/connectrpc/eliza/v1/elizav1connect"
 )
@@ -110,8 +111,10 @@ func main() {
 	}
 }
 
+// quicConfig writes a qlog trace of every connection to $QLOGDIR when it is set, which shows the server's side of a
+// handshake: when each packet arrived and when it answered.
 func quicConfig(maxIdle, keepAlive time.Duration) *quic.Config {
-	return &quic.Config{MaxIdleTimeout: maxIdle, KeepAlivePeriod: keepAlive}
+	return &quic.Config{MaxIdleTimeout: maxIdle, KeepAlivePeriod: keepAlive, Tracer: qlog.DefaultConnectionTracer}
 }
 
 func newHTTP3Server(handler http.Handler, tlsConfig *tls.Config, quicConfig *quic.Config) *http3.Server {

@@ -161,6 +161,7 @@ jobs:
         env:
           FLUTTER: flutter
           SUITES: native
+          QLOGDIR: ${{ runner.temp }}/qlog/native
         run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       # Runs after a failed native suite too, but not when setup failed and the native suite never ran.
       - name: Dart integration tests
@@ -169,6 +170,7 @@ jobs:
         env:
           FLUTTER: flutter
           SUITES: dart
+          QLOGDIR: ${{ runner.temp }}/qlog/dart
         run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       - name: Upload logs
         if: always()
@@ -179,6 +181,7 @@ jobs:
           path: |
             build/integration_test_*.log
             ${{ runner.temp }}/sim-network.log
+            ${{ runner.temp }}/qlog
           if-no-files-found: ignore
 
   android-integration:
