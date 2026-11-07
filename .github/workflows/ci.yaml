@@ -145,38 +145,30 @@ jobs:
           fi
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
           xcrun simctl bootstatus "$udid" -b
-      # DEBUG: the first few Dart cases time out before the TLS ClientHello. Record what the app's network stack does.
-      - name: "DEBUG: stream simulator network logs"
+      # The network stack's view of every connection the tests make (QUIC vs TCP races, handshakes), uploaded below.
+      # Cheap, and the only way to see why a connection stalled or fell back to HTTP/2.
+      - name: Record the simulator's network log
         timeout-minutes: 2
         run: |
           nohup xcrun simctl spawn "${{ steps.simulator.outputs.udid }}" log stream --level debug --style compact \
-            --predicate 'process == "Runner" AND (subsystem == "com.apple.network" OR subsystem == "com.apple.CFNetwork")' \
+            --predicate '(process == "Runner" OR process == "xctest") AND (subsystem == "com.apple.network" OR subsystem == "com.apple.CFNetwork")' \
             > "$RUNNER_TEMP/sim-network.log" 2>&1 &
-      - name: Dart integration tests
-        id: dart
-        timeout-minutes: 15
-        env:
-          FLUTTER: flutter
-          SUITES: dart
-        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
-      # DEBUG: if the same cases pass on a second run, the failures come from a freshly booted simulator.
-      - name: "DEBUG: Dart integration tests again"
-        if: ${{ !cancelled() && (steps.dart.outcome == 'success' || steps.dart.outcome == 'failure') }}
-        continue-on-error: true
-        timeout-minutes: 15
-        env:
-          FLUTTER: flutter
-          SUITES: dart
-        run: |
-          pkill -f 'log stream' || true
-          ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
-      # Runs after a failed Dart suite too, but not when setup failed and the Dart suite never ran.
+      # First, since it also warms up the simulator: right after boot, the first minute of connections from the Dart
+      # suite stalled before the TLS handshake on every run, and passed when the suite ran again.
       - name: Native bridge tests (XCTest)
-        if: ${{ !cancelled() && (steps.dart.outcome == 'success' || steps.dart.outcome == 'failure') }}
+        id: native
         timeout-minutes: 15
         env:
           FLUTTER: flutter
           SUITES: native
+        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+      # Runs after a failed native suite too, but not when setup failed and the native suite never ran.
+      - name: Dart integration tests
+        if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
+        timeout-minutes: 15
+        env:
+          FLUTTER: flutter
+          SUITES: dart
         run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       - name: Upload logs
         if: always()

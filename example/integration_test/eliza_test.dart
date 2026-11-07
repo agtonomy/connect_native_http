@@ -66,8 +66,8 @@ final class Harness {
 }
 
 /// Every case finishes in a few seconds against a local server; a hang should fail fast, not after 10 minutes.
-void testCase(String description, WidgetTesterCallback body) =>
-    testWidgets(description, body, timeout: const Timeout(Duration(seconds: 20)));
+void testCase(String description, WidgetTesterCallback body, {Duration timeout = const Duration(seconds: 20)}) =>
+    testWidgets(description, body, timeout: Timeout(timeout));
 
 Future<void> admin(String path) async {
   final client = io.HttpClient();
@@ -87,6 +87,30 @@ Future<(StreamController<ConverseRequest>, StreamIterator<ConverseResponse>)> op
   expect(await responses.moveNext(), isTrue);
   expect(responses.current.sentence, 'hello');
   return (requests, responses);
+}
+
+/// A client whose pooled connection to the server negotiated HTTP/3, for the cases that only apply over QUIC.
+///
+/// URLSession races QUIC against TCP for each new connection and keeps whichever connects first, so on a loaded
+/// device a connection sometimes lands on HTTP/2 even for an HTTP/3 origin. A client keeps reusing the connection it
+/// has, so each attempt uses a fresh client, closing the ones that got HTTP/2.
+Future<Harness> harnessOverHttp3() async {
+  final deadline = DateTime.now().add(const Duration(seconds: 8));
+  final protocols = <String>[];
+  while (true) {
+    final harness = await Harness.create(serverUrl, http3Origins: {Uri.parse(serverUrl)});
+    await harness.eliza.say(SayRequest(sentence: 'which protocol'), onHeader: harness.recordHeaders);
+    final protocol = harness.serverProtocols.last;
+    if (protocol == 'HTTP/3.0') {
+      addTearDown(harness.native.close);
+      return harness;
+    }
+    protocols.add(protocol);
+    await harness.native.close();
+    if (DateTime.now().isAfter(deadline)) {
+      fail('no connection negotiated HTTP/3 in ${protocols.length} attempts: $protocols');
+    }
+  }
 }
 
 Future<NativeHttpException> nativeCause(Future<Object?> call) async {
@@ -225,18 +249,22 @@ void main() {
     return false;
   }
 
+  // Up to 8 s of harnessOverHttp3 on top of the case itself.
+  const http3CaseTimeout = Duration(seconds: 30);
+
   testCase('a quiet HTTP/3 stream outlives the idle timeout while the server pings', (_) async {
     if (skipUnlessHttp3()) {
       return;
     }
-    final (requests, responses) = await openQuietConverse(harness);
-    expect(harness.serverProtocols.last, 'HTTP/3.0');
+    final h3 = await harnessOverHttp3();
+    final (requests, responses) = await openQuietConverse(h3);
+    expect(h3.serverProtocols.last, 'HTTP/3.0');
     await Future<void>.delayed(serverMaxIdle * 2);
     requests.add(ConverseRequest(sentence: 'still there'));
     expect(await responses.moveNext(), isTrue);
     expect(responses.current.sentence, 'echo: still there');
     await requests.close();
-  });
+  }, timeout: http3CaseTimeout);
 
   testCase('a unary call the server holds longer than the idle timeout completes', (_) async {
     // A long-running unary call: nothing flows until the reply, so only the server's pings keep the connection from
@@ -244,22 +272,24 @@ void main() {
     if (skipUnlessHttp3()) {
       return;
     }
+    final h3 = await harnessOverHttp3();
     final hold = serverMaxIdle * 2 + const Duration(seconds: 1);
-    final res = await harness.eliza.say(
+    final res = await h3.eliza.say(
       SayRequest(sentence: 'sleep:${hold.inMilliseconds}'),
       signal: TimeoutSignal(const Duration(seconds: 15)),
-      onHeader: harness.recordHeaders,
+      onHeader: h3.recordHeaders,
     );
     expect(res.sentence, 'say: sleep:${hold.inMilliseconds}');
-    expect(harness.serverProtocols.last, 'HTTP/3.0');
-  });
+    expect(h3.serverProtocols.last, 'HTTP/3.0');
+  }, timeout: http3CaseTimeout);
 
   testCase('a dead HTTP/3 path fails an open stream', (_) async {
     if (skipUnlessHttp3()) {
       return;
     }
-    final (requests, responses) = await openQuietConverse(harness);
-    expect(harness.serverProtocols.last, 'HTTP/3.0');
+    final h3 = await harnessOverHttp3();
+    final (requests, responses) = await openQuietConverse(h3);
+    expect(h3.serverProtocols.last, 'HTTP/3.0');
     addTearDown(() => admin('/unfreeze'));
     await admin('/freeze?for=60s');
 
@@ -272,5 +302,5 @@ void main() {
     // simulator a 3 s server value was detected in 2.98 s.
     expect(stopwatch.elapsed, lessThan(serverMaxIdle + const Duration(seconds: 2)));
     await requests.close();
-  });
+  }, timeout: http3CaseTimeout);
 }
