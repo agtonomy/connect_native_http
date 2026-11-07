@@ -6,18 +6,21 @@
 #   ./run_integration_tests.sh android <adb serial, e.g. emulator-5554>
 #   ./run_integration_tests.sh ios <udid> --plain-name 'bidi'   # extra arguments go to `flutter test`
 #   SUITES=native ./run_integration_tests.sh ios <udid>         # only the native tests; SUITES=dart for only Dart
-#
+#   FLUTTER=flutter ./run_integration_tests.sh ios <udid>       # use the flutter on PATH instead of `fvm flutter`#
 # iOS: the server's CA goes into the simulator's keychain, and calls should go over HTTP/3.
 # Android: the CA is bundled into the example app. Cronet only uses QUIC with public roots, so this checks HTTP/2;
 # HTTP/3 on Android needs a server with a publicly trusted certificate.
 #
-# Output goes to the terminal and to build/integration_test.log.
+# Output goes to the terminal and to build/integration_test_<platform>_<suites>.log.
 set -euo pipefail
 
 PLATFORM="${1:?usage: $0 ios|android <device id> [flutter test args]}"
 DEVICE="${2:?usage: $0 ios|android <device id> [flutter test args]}"
+# Expanded as ${EXTRA_ARGS[@]+...} below: macOS's bash 3.2 treats an empty array as unbound under `set -u`.
 EXTRA_ARGS=("${@:3}")
 SUITES="${SUITES:-dart native}"
+# Split on spaces, so the default runs as `fvm flutter`.
+read -ra FLUTTER <<< "${FLUTTER:-fvm flutter}"
 PORT=8443
 ADMIN_PORT=8081
 # Short QUIC settings so the idle-timeout tests take seconds, not the server's 30 s default.
@@ -25,6 +28,47 @@ MAX_IDLE_SECONDS=3
 KEEPALIVE=1s
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_PID=""
+
+# Waits for the server's graceful shutdown, so a run started right after this one can bind the same ports. The server
+# shares this script's output, so one left running would also keep the log's tee, and whatever waits on it, open.
+stop_server() {
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null && wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+  fi
+}
+
+# Kills a process and everything it started: a flutter or gradle left without its parent keeps writing to, and holding
+# open, this script's output.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1"); do
+    kill_tree "$child"
+  done
+  kill "$1" 2>/dev/null || true
+}
+
+# Runs a command and kills it once it has run for the given seconds, so a hang (an app that never launches, a stuck
+# build) fails fast and says what hung; macOS has no timeout(1). The watchdog's sleep writes nowhere, so even a sleep
+# left behind can't hold this script's output, and the log's tee, open.
+with_timeout() {
+  local limit=$1
+  shift
+  "$@" &
+  local pid=$!
+  (
+    sleep "$limit" > /dev/null 2>&1
+    echo "timed out after ${limit}s: $*" >&2
+    kill_tree "$pid"
+  ) &
+  local watchdog=$!
+  local status=0
+  wait "$pid" || status=$?
+  kill "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null || true
+  return "$status"
+}
 
 run() {
 case "$PLATFORM" in
@@ -54,7 +98,7 @@ case "$PLATFORM" in
 esac
 
 echo "Building the test server"
-(cd "$ROOT/test_server" && go build -o connect-native-http-test-server .)
+with_timeout 120 go -C "$ROOT/test_server" build -o connect-native-http-test-server .
 
 # A server left over from an earlier run would hold the ports, make this one exit, and answer in its place.
 if curl -s -o /dev/null "http://localhost:$ADMIN_PORT/"; then
@@ -64,8 +108,6 @@ fi
 "$ROOT/test_server/connect-native-http-test-server" -addr ":$PORT" -hosts "$HOSTS" \
   -certdir "$ROOT/test_server/certs" -admin-addr ":$ADMIN_PORT" -max-idle "${MAX_IDLE_SECONDS}s" -keepalive "$KEEPALIVE" &
 SERVER_PID=$!
-# Wait for the server's graceful shutdown, so a run started right after this one can bind the same ports.
-trap 'kill $SERVER_PID 2>/dev/null && wait $SERVER_PID 2>/dev/null || true' EXIT
 # The admin endpoint comes up after the certificates and both listeners, so it doubles as a readiness check.
 ready=0
 for _ in $(seq 50); do
@@ -82,7 +124,7 @@ fi
 
 case "$PLATFORM" in
   ios)
-    xcrun simctl keychain "$DEVICE" add-root-cert "$ROOT/test_server/certs/ca.pem"
+    with_timeout 30 xcrun simctl keychain "$DEVICE" add-root-cert "$ROOT/test_server/certs/ca.pem"
     ;;
   android)
     mkdir -p "$ROOT/example/android/app/src/main/res/raw"
@@ -93,27 +135,27 @@ esac
 cd "$ROOT/example"
 if [[ " $SUITES " == *" dart "* ]]; then
   echo "Dart integration tests"
-  fvm flutter test integration_test -d "$DEVICE" \
+  # Builds and launches the app once per test file, then runs it: about a minute when warm, a few cold. Each case
+  # has its own, shorter timeout; this one catches an app that never launches or never connects.
+  with_timeout 480 "${FLUTTER[@]}" test integration_test -d "$DEVICE" \
     --dart-define=SERVER_URL="$SERVER_URL" \
     --dart-define=UNTRUSTED_URL="$UNTRUSTED_URL" \
     --dart-define=UNREACHABLE_URL="$UNREACHABLE_URL" \
     --dart-define=EXPECT_PROTOCOL="$EXPECT_PROTOCOL" \
     --dart-define=ADMIN_URL="$ADMIN_URL" \
     --dart-define=SERVER_MAX_IDLE_SECONDS="$MAX_IDLE_SECONDS" \
-    "${EXTRA_ARGS[@]}"
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 fi
 if [[ " $SUITES " == *" native "* ]]; then
   echo "Native plugin tests"
   case "$PLATFORM" in
     ios)
-      # The Flutter-free core's package tests, built by xcodebuild and run on the simulator by xctest directly,
-      # which skips xcodebuild's test session and result bundle. SIMCTL_CHILD_ variables reach the tests without
-      # the prefix. Xcode evaluates package manifests in a sandbox of its own, which can't start inside another
-      # sandbox; this manifest is ours and, core only, has no dependencies, so it runs without one.
-      (cd "$ROOT/ios/connect_native_http" && CONNECT_NATIVE_HTTP_CORE_ONLY=1 xcodebuild build-for-testing -quiet \
-        -IDEPackageSupportDisableManifestSandbox=YES -scheme connect_native_http-Package -destination "id=$DEVICE" \
-        -derivedDataPath "$ROOT/build/ios_core_tests")
-      SIMCTL_CHILD_SERVER_URL="$SERVER_URL" SIMCTL_CHILD_SERVER_CA="$ROOT/test_server/certs/ca.der" \
+      # The Flutter-free core's package tests, run on the simulator by xctest directly, which skips xcodebuild's test
+      # session and result bundle. SIMCTL_CHILD_ variables reach the tests without the prefix. The build is a no-op
+      # when CI has already run it.
+      with_timeout 300 "$ROOT/ios/connect_native_http/build_core_tests.sh" "$ROOT/build/ios_core_tests"
+      # The tests take about a second.
+      with_timeout 60 env SIMCTL_CHILD_SERVER_URL="$SERVER_URL" SIMCTL_CHILD_SERVER_CA="$ROOT/test_server/certs/ca.der" \
         xcrun simctl spawn "$DEVICE" \
         "$(xcrun --sdk iphonesimulator --show-sdk-platform-path)/Developer/Library/Xcode/Agents/xctest" \
         "$ROOT/build/ios_core_tests/Build/Products/Debug-iphonesimulator/ConnectNativeHttpCoreTests.xctest"
@@ -123,13 +165,19 @@ if [[ " $SUITES " == *" native "* ]]; then
       # plugin. Flutter writes example/android/gradlew.
       mkdir -p "$ROOT/android/src/androidTest/res/raw"
       cp "$ROOT/test_server/certs/ca.pem" "$ROOT/android/src/androidTest/res/raw/test_server_ca.pem"
-      fvm flutter build apk --debug --config-only
-      (cd android && ANDROID_SERIAL="$DEVICE" ./gradlew :connect_native_http:connectedDebugAndroidTest \
-        -Pandroid.testInstrumentationRunnerArguments.serverUrl="$SERVER_URL")
+      with_timeout 120 "${FLUTTER[@]}" build apk --debug --config-only
+      with_timeout 300 env ANDROID_SERIAL="$DEVICE" android/gradlew -p android \
+        :connect_native_http:connectedDebugAndroidTest \
+        -Pandroid.testInstrumentationRunnerArguments.serverUrl="$SERVER_URL"
       ;;
   esac
 fi
+stop_server
 }
 
 mkdir -p "$ROOT/build"
-run 2>&1 | tee "$ROOT/build/integration_test.log"
+# run executes in this shell, not in a pipeline's subshell, so the EXIT trap reliably stops the server. On a macOS
+# runner, a trap set inside `run | tee` once missed, and the orphaned server held tee open after the tests passed.
+exec > >(tee "$ROOT/build/integration_test_${PLATFORM}_${SUITES// /_}.log") 2>&1
+trap stop_server EXIT
+run
