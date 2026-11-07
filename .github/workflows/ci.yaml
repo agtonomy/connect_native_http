@@ -319,12 +319,23 @@ jobs:
           for setting in window_animation_scale transition_animation_scale animator_duration_scale; do
             "$adb" -s emulator-5554 shell settings put global "$setting" 0
           done
+          # The emulator logs everything verbosely (androidboot.logcat=*:V) and tries to raise the buffer to 2M
+          # itself, but its adb call fails while the device is still offline. A small buffer wraps within seconds.
+          "$adb" -s emulator-5554 logcat -G 16M
+      # The device's view of the app launch, uploaded below: flutter test finds the app's VM service in logcat, and
+      # once installed the app and then waited 8 minutes without connecting to it.
+      - name: Record logcat
+        timeout-minutes: 2
+        run: |
+          nohup "$ANDROID_HOME/platform-tools/adb" -s emulator-5554 logcat -v threadtime \
+            > "$RUNNER_TEMP/logcat.log" 2>&1 &
       - name: Dart integration tests
         timeout-minutes: 8
         env:
           FLUTTER: flutter
           SUITES: dart
-        run: ./run_integration_tests.sh android emulator-5554
+        # DEBUG -v: shows what flutter test waits on when it doesn't connect to the app (see Record logcat).
+        run: ./run_integration_tests.sh android emulator-5554 -v
       # Runs after a failed Dart suite too, but not when the emulator never came up.
       - name: Native bridge tests (instrumented)
         if: ${{ !cancelled() && steps.emulator.outcome == 'success' }}
@@ -342,6 +353,7 @@ jobs:
           path: |
             build/integration_test_*.log
             ${{ runner.temp }}/emulator.log
+            ${{ runner.temp }}/logcat.log
           if-no-files-found: ignore
 
   # The one check to mark as required. It runs even when a job it needs fails, so it reports failure instead of
