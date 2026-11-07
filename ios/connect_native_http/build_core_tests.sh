@@ -6,7 +6,11 @@
 #   ios/connect_native_http/build_core_tests.sh build/ios_core_tests
 set -euo pipefail
 
-DERIVED_DATA="$(cd "$(dirname "${1:?usage: $0 <derived data directory>}")" && pwd)/$(basename "$1")"
+# Its parent may not exist yet: on a fresh CI checkout nothing has created build/. Resolved on a line of its own, so
+# set -e stops on a failed cd; within a longer assignment, the last substitution's status hides it.
+mkdir -p "$(dirname "${1:?usage: $0 <derived data directory>}")"
+parent="$(cd "$(dirname "$1")" && pwd)"
+DERIVED_DATA="$parent/$(basename "$1")"
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # A generic destination, so the build doesn't depend on which simulator, or whether one is booted, runs it. Xcode evaluates package manifests in a sandbox of its own, which can't start inside another sandbox; this manifest
