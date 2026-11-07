@@ -152,10 +152,15 @@ jobs:
         timeout-minutes: 5
         run: |
           patch_file="$PWD/.github/flutter-patches/ios-simulator-log-stream-ready.diff"
-          if patch -d "$FLUTTER_ROOT" -p1 -R --dry-run -s < "$patch_file" > /dev/null 2>&1; then
+          target="$FLUTTER_ROOT/packages/flutter_tools/lib/src/ios/simulators.dart"
+          # A line only the patch adds tells whether the cached SDK has it. Not `patch -R --dry-run`: macOS's patch
+          # takes a reverse of an unapplied patch as a forward one and succeeds, so the SDK went unpatched.
+          marker='await logReader._ready.future;'
+          if grep -qF "$marker" "$target"; then
             echo "already applied (restored from the SDK cache)"
           else
             patch -d "$FLUTTER_ROOT" -p1 --forward < "$patch_file"
+            grep -qF "$marker" "$target"
             rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp" "$FLUTTER_ROOT/bin/cache/flutter_tools.snapshot"
           fi
           flutter --version
