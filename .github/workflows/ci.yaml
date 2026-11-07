@@ -118,6 +118,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
+      # Xcode's derived data (its module cache for the simulator SDK above all), the Flutter app's build directory and
+      # the core tests' build. Saved again only when the inputs change; otherwise the latest is restored.
+      - name: Cache iOS builds
+        uses: actions/cache@v6
+        timeout-minutes: 5
+        with:
+          path: |
+            ~/Library/Developer/Xcode/DerivedData
+            example/build/ios
+            build/ios_core_tests
+          key: ios-builds-${{ hashFiles('.fvmrc', 'pubspec.yaml', 'lib/**', 'ios/**', 'example/pubspec.yaml', 'example/lib/**', 'example/ios/**', 'example/integration_test/**') }}
+          restore-keys: ios-builds-
       - parallel:
           - uses: actions/setup-go@v7
             timeout-minutes: 5
@@ -129,6 +141,10 @@ jobs:
             timeout-minutes: 10
             with:
               post-setup-script: flutter config --enable-swift-package-manager
+          # Needs neither Go nor Flutter, nor a booted simulator; the native step then finds it up to date.
+          - name: Build native bridge tests
+            timeout-minutes: 10
+            run: ios/connect_native_http/build_core_tests.sh build/ios_core_tests
       # Not in the group above: the simulator's first-boot data migration saturates the runner's disk, and in parallel
       # it stalled the Flutter download to under 1 MB/s and timed out setup-go.
       - name: Boot simulator
@@ -216,6 +232,15 @@ jobs:
             with:
               path: /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API_LEVEL }}
               key: android-system-image-${{ env.ANDROID_API_LEVEL }}-google_apis-x86_64
+          # Gradle's build cache (org.gradle.caching in example/android/gradle.properties): task outputs by content
+          # hash. setup-java's cache holds only the dependencies, and never saves again once its key exists.
+          - name: Cache Gradle build outputs
+            uses: actions/cache@v6
+            timeout-minutes: 5
+            with:
+              path: ~/.gradle/caches/build-cache-1
+              key: gradle-build-cache-${{ hashFiles('.fvmrc', 'pubspec.yaml', 'lib/**', 'android/**', 'example/pubspec.yaml', 'example/lib/**', 'example/android/**', 'example/integration_test/**') }}
+              restore-keys: gradle-build-cache-
       - parallel:
           # Leaves the emulator booting in the background, through the builds below; "Wait for emulator" joins it.
           # Two of the runner's four cores go to the emulator and the rest to Gradle.

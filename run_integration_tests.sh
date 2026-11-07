@@ -117,13 +117,10 @@ if [[ " $SUITES " == *" native "* ]]; then
   echo "Native plugin tests"
   case "$PLATFORM" in
     ios)
-      # The Flutter-free core's package tests, built by xcodebuild and run on the simulator by xctest directly,
-      # which skips xcodebuild's test session and result bundle. SIMCTL_CHILD_ variables reach the tests without
-      # the prefix. Xcode evaluates package manifests in a sandbox of its own, which can't start inside another
-      # sandbox; this manifest is ours and, core only, has no dependencies, so it runs without one.
-      (cd "$ROOT/ios/connect_native_http" && CONNECT_NATIVE_HTTP_CORE_ONLY=1 xcodebuild build-for-testing -quiet \
-        -IDEPackageSupportDisableManifestSandbox=YES -scheme connect_native_http-Package -destination "id=$DEVICE" \
-        -derivedDataPath "$ROOT/build/ios_core_tests")
+      # The Flutter-free core's package tests, run on the simulator by xctest directly, which skips xcodebuild's test
+      # session and result bundle. SIMCTL_CHILD_ variables reach the tests without the prefix. The build is a no-op
+      # when CI has already run it.
+      "$ROOT/ios/connect_native_http/build_core_tests.sh" "$ROOT/build/ios_core_tests"
       SIMCTL_CHILD_SERVER_URL="$SERVER_URL" SIMCTL_CHILD_SERVER_CA="$ROOT/test_server/certs/ca.der" \
         xcrun simctl spawn "$DEVICE" \
         "$(xcrun --sdk iphonesimulator --show-sdk-platform-path)/Developer/Library/Xcode/Agents/xctest" \
