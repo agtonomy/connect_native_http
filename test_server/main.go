@@ -8,8 +8,7 @@
 //
 // -max-idle and -keepalive set the server's QUIC idle timeout and ping interval. QUIC uses the smaller of the two
 // endpoints' idle timeouts, so -max-idle also bounds how long a client takes to notice a dead path. -admin-addr
-// serves a plain-HTTP endpoint that freezes the HTTP/3 path (see adminHandler). It starts once the server has sent
-// itself a request over each protocol (see warmUp), so callers can poll it to tell that the server is ready.
+// serves a plain-HTTP endpoint that freezes the HTTP/3 path (see adminHandler).
 package main
 
 import (
@@ -70,51 +69,33 @@ func main() {
 	handler := protocolHeaders(newElizaMux(), *altSvc)
 	tlsConfig := newTLSConfig(cert)
 	h2 := &http.Server{Addr: *addr, Handler: handler, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second}
-	// Listening here rather than in the goroutine lets the warm-up below connect without racing the listener.
-	tcp, err := net.Listen("tcp", *addr)
-	if err != nil {
-		log.Fatalf("http2: %v", err)
-	}
 	go func() {
-		if err := h2.ServeTLS(tcp, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := h2.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http2: %v", err)
 		}
 	}()
 
 	var h3 *http3.Server
-	var conn *freezablePacketConn
 	if !*noH3 {
 		udp, err := net.ListenPacket("udp", *h3Addr)
 		if err != nil {
 			log.Fatalf("http3: %v", err)
 		}
-		conn = &freezablePacketConn{PacketConn: udp}
+		conn := &freezablePacketConn{PacketConn: udp}
 		h3 = newHTTP3Server(handler, tlsConfig, quicConfig(*maxIdle, *keepAlive))
 		go func() {
 			if err := h3.Serve(conn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Fatalf("http3: %v", err)
 			}
 		}()
-	}
-
-	// Before the admin endpoint, which callers poll to tell that the server is ready.
-	warmUDP := *h3Addr
-	if *noH3 {
-		warmUDP = ""
-	}
-	if h3Took, h2Took, err := warmUp(cert, strings.TrimSpace(strings.Split(*hosts, ",")[0]), *addr, warmUDP); err != nil {
-		log.Printf("warm-up failed, so the first connections may be slow: %v", err)
-	} else {
-		log.Printf("warmed up: HTTP/3 in %s, HTTP/2 in %s", h3Took, h2Took)
-	}
-
-	if conn != nil && *adminAddr != "" {
-		admin := &http.Server{Addr: *adminAddr, Handler: adminHandler(conn), ReadHeaderTimeout: 10 * time.Second}
-		go func() {
-			if err := admin.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Fatalf("admin: %v", err)
-			}
-		}()
+		if *adminAddr != "" {
+			admin := &http.Server{Addr: *adminAddr, Handler: adminHandler(conn), ReadHeaderTimeout: 10 * time.Second}
+			go func() {
+				if err := admin.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					log.Fatalf("admin: %v", err)
+				}
+			}()
+		}
 	}
 	log.Printf("listening: tcp %s, udp %s (h3 %t, max idle %s, keepalive %s), admin %q, Alt-Svc %q, CA in %s",
 		*addr, *h3Addr, !*noH3, *maxIdle, *keepAlive, *adminAddr, *altSvc, *certDir)
