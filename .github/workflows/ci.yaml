@@ -161,6 +161,8 @@ jobs:
           fi
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
           xcrun simctl bootstatus "$udid" -b
+          # Every step targets $udid; anything else booted could answer in its place.
+          xcrun simctl list devices booted
       # The network stack's view of every connection the tests make (QUIC vs TCP races, handshakes), uploaded below.
       # Cheap, and the only way to see why a connection stalled or fell back to HTTP/2.
       - name: Record the simulator's network log
