@@ -145,6 +145,20 @@ jobs:
           - name: Build native bridge tests
             timeout-minutes: 6
             run: ios/connect_native_http/build_core_tests.sh build/ios_core_tests
+      # flutter test sometimes misses the app's VM service in the simulator's log and waits forever (flutter/flutter
+      # #181771; see the patch). Fails when the patch no longer applies, which means .fvmrc moved: drop it then if the
+      # new release has the fix. Removing the stamp makes the next flutter command rebuild the tool, done here.
+      - name: Patch flutter_tools for the simulator log race
+        timeout-minutes: 5
+        run: |
+          patch_file="$PWD/.github/flutter-patches/ios-simulator-log-stream-ready.diff"
+          if patch -d "$FLUTTER_ROOT" -p1 -R --dry-run -s < "$patch_file" > /dev/null 2>&1; then
+            echo "already applied (restored from the SDK cache)"
+          else
+            patch -d "$FLUTTER_ROOT" -p1 --forward < "$patch_file"
+            rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp" "$FLUTTER_ROOT/bin/cache/flutter_tools.snapshot"
+          fi
+          flutter --version
       # Not in the group above: the simulator's first-boot data migration saturates the runner's disk, and in parallel
       # it stalled the Flutter download to under 1 MB/s and timed out setup-go.
       - name: Boot simulator
