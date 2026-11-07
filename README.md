@@ -188,6 +188,8 @@ Neither platform finishes a stream on its own while the client still has its req
     simulate a dead HTTP/3 path.
   - Its own tests (`go test ./...`) check it over HTTP/3, including the idle timeout, pings and freezing.
   - It creates a CA in `test_server/certs/` on first start and reuses it, so a device only has to trust it once.
+  - With `QLOGDIR` set, it writes a qlog trace of each QUIC connection there, which shows the server's side of a
+    handshake.
   - `test_server/generate.sh` regenerates its stubs and the example's Dart client.
 - **`example/integration_test/eliza_test.dart`:** run on a booted simulator or emulator. The script also starts the
   server:
@@ -197,11 +199,15 @@ Neither platform finishes a stream on its own while the client still has its req
   ./run_integration_tests.sh android emulator-5554
   ./run_integration_tests.sh ios <udid> --plain-name bidi   # extra arguments go to `flutter test`
   SUITES=native ./run_integration_tests.sh ios <udid>       # only the native tests; SUITES=dart for only Dart
+  FLUTTER=flutter ./run_integration_tests.sh ios <udid>     # the flutter on PATH instead of `fvm flutter`
   ```
+
+  Output also goes to `build/integration_test_<platform>_<suites>.log`.
 
   It covers unary calls, errors, deadlines, server streaming, and full-duplex bidi where the server speaks first and
   finishes first. It also checks the failure classes (`notSent`, `untrusted`) and the negotiated protocol: HTTP/3 on
-  iOS, and HTTP/2 on Android, since the server's private CA keeps Cronet off QUIC.
+  iOS, and HTTP/2 on Android, since the server's private CA keeps Cronet off QUIC. On iOS a fresh client's first call
+  must already be HTTP/3: on this local path, a fallback to TCP is a failure.
 
   The script starts the server with a 3 s idle timeout and 1 s pings. Over HTTP/3 (iOS) the tests also check two
   things: a quiet stream outlives the idle timeout, and a frozen path fails an open stream within it.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -42,6 +43,24 @@ func (c *freezablePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		return len(p), nil
 	}
 	return c.PacketConn.WriteTo(p, addr)
+}
+
+// SetReadBuffer and SetWriteBuffer let quic-go size the socket's buffers, which it does through these methods when
+// the conn is not a *net.UDPConn. It would otherwise keep the OS defaults, and drop datagrams that arrive in a burst.
+// The conn deliberately doesn't expose SyscallConn or ReadMsgUDP: with them, quic-go reads batches straight from the
+// socket, around ReadFrom and so around Freeze.
+func (c *freezablePacketConn) SetReadBuffer(bytes int) error {
+	if b, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return b.SetReadBuffer(bytes)
+	}
+	return errors.New("the underlying conn can't set its receive buffer")
+}
+
+func (c *freezablePacketConn) SetWriteBuffer(bytes int) error {
+	if b, ok := c.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return b.SetWriteBuffer(bytes)
+	}
+	return errors.New("the underlying conn can't set its send buffer")
 }
 
 // adminHandler lets tests on a device freeze the HTTP/3 path over plain HTTP:

@@ -1,0 +1,402 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Every job and every step has a timeout, a few times its usual duration, so a hung step fails on its own name instead
+# of using up the job's budget.
+jobs:
+  dart:
+    name: Dart format, analyze and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+      - name: Set up Flutter from .fvmrc
+        uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+        timeout-minutes: 10
+      - name: Get dependencies
+        timeout-minutes: 5
+        run: |
+          flutter pub get
+          flutter pub get --directory example
+      - name: Check formatting
+        timeout-minutes: 2
+        run: dart format --output=none --set-exit-if-changed .
+      - name: Analyze package
+        timeout-minutes: 5
+        run: flutter analyze
+      - name: Analyze example
+        timeout-minutes: 5
+        run: flutter analyze example
+      - name: Unit tests
+        timeout-minutes: 5
+        run: flutter test
+
+  test-server:
+    name: Go test server
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: test_server
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+      - uses: actions/setup-go@v7
+        timeout-minutes: 5
+        with:
+          go-version-file: test_server/go.mod
+          cache-dependency-path: test_server/go.sum
+      - name: Check formatting
+        timeout-minutes: 2
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: Vet
+        timeout-minutes: 5
+        run: go vet ./...
+      - name: Test
+        timeout-minutes: 5
+        run: go test ./...
+
+  swift-core:
+    name: Swift core tests (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+      - uses: actions/setup-go@v7
+        timeout-minutes: 5
+        with:
+          go-version-file: test_server/go.mod
+          cache-dependency-path: test_server/go.sum
+      - name: Start test server
+        timeout-minutes: 5
+        run: |
+          cd test_server
+          go build -o connect-native-http-test-server .
+          ./connect-native-http-test-server -addr :8443 -hosts localhost -certdir certs -admin-addr :8081 \
+            > server.log 2>&1 &
+          for _ in $(seq 100); do
+            if curl -sf -X POST http://localhost:8081/unfreeze >/dev/null; then exit 0; fi
+            sleep 0.1
+          done
+          echo "test server did not come up" >&2
+          cat server.log >&2
+          exit 1
+      - name: Swift tests
+        timeout-minutes: 5
+        working-directory: ios/connect_native_http
+        env:
+          CONNECT_NATIVE_HTTP_CORE_ONLY: "1"
+          SERVER_URL: https://localhost:8443
+          SERVER_CA: ${{ github.workspace }}/test_server/certs/ca.der
+        run: swift test
+      - name: Upload test server log
+        if: failure()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-core-server-log
+          path: test_server/server.log
+
+  ios-integration:
+    name: iOS integration tests (simulator)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+      # Xcode's derived data (its module cache for the simulator SDK above all), the Flutter app's build directory and
+      # the core tests' build. Saved again only when the inputs change; otherwise the latest is restored.
+      - name: Cache iOS builds
+        uses: actions/cache@v6
+        timeout-minutes: 5
+        with:
+          path: |
+            ~/Library/Developer/Xcode/DerivedData
+            example/build/ios
+            build/ios_core_tests
+          key: ios-builds-${{ hashFiles('.fvmrc', 'pubspec.yaml', 'lib/**', 'ios/**', 'example/pubspec.yaml', 'example/lib/**', 'example/ios/**', 'example/integration_test/**') }}
+          restore-keys: ios-builds-
+      - parallel:
+          - uses: actions/setup-go@v7
+            timeout-minutes: 5
+            with:
+              go-version-file: test_server/go.mod
+              cache-dependency-path: test_server/go.sum
+          - name: Set up Flutter from .fvmrc
+            uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+            timeout-minutes: 6
+            with:
+              post-setup-script: flutter config --enable-swift-package-manager
+          # Needs neither Go nor Flutter, nor a booted simulator; the native step then finds it up to date.
+          - name: Build native bridge tests
+            timeout-minutes: 6
+            run: ios/connect_native_http/build_core_tests.sh build/ios_core_tests
+      # flutter test sometimes misses the app's VM service in the simulator's log and waits forever (flutter/flutter
+      # #181771; see the patch). Fails when the patch no longer applies, which means .fvmrc moved: drop it then if the
+      # new release has the fix. Removing the stamp makes the next flutter command rebuild the tool, done here.
+      - name: Patch flutter_tools for the simulator log race
+        timeout-minutes: 5
+        run: |
+          patch_file="$PWD/.github/flutter-patches/ios-simulator-log-stream-ready.diff"
+          target="$FLUTTER_ROOT/packages/flutter_tools/lib/src/ios/simulators.dart"
+          # A line only the patch adds tells whether the cached SDK has it. Not `patch -R --dry-run`: macOS's patch
+          # takes a reverse of an unapplied patch as a forward one and succeeds, so the SDK went unpatched.
+          marker='await logReader._ready.future;'
+          if grep -qF "$marker" "$target"; then
+            echo "already applied (restored from the SDK cache)"
+          else
+            patch -d "$FLUTTER_ROOT" -p1 --forward < "$patch_file"
+            grep -qF "$marker" "$target"
+            rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp" "$FLUTTER_ROOT/bin/cache/flutter_tools.snapshot"
+          fi
+          flutter --version
+      # Not in the group above: the simulator's first-boot data migration saturates the runner's disk, and in parallel
+      # it stalled the Flutter download to under 1 MB/s and timed out setup-go.
+      - name: Boot simulator
+        id: simulator
+        timeout-minutes: 5
+        run: |
+          udid=$(xcrun simctl list devices available --json |
+            jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
+              select(.name | startswith("iPhone"))] | last | .udid')
+          if [[ -z "$udid" || "$udid" == null ]]; then
+            xcrun simctl list devices available
+            echo "no iPhone simulator available" >&2
+            exit 1
+          fi
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          xcrun simctl bootstatus "$udid" -b
+          # Every step targets $udid; anything else booted could answer in its place.
+          xcrun simctl list devices booted
+      # The network stack's view of every connection the tests make (QUIC vs TCP races, handshakes), uploaded below.
+      # Cheap, and the only way to see why a connection stalled or fell back to HTTP/2.
+      - name: Record the simulator's network log
+        timeout-minutes: 2
+        run: |
+          nohup xcrun simctl spawn "${{ steps.simulator.outputs.udid }}" log stream --level debug --style compact \
+            --predicate '(process == "Runner" OR process == "xctest") AND (subsystem == "com.apple.network" OR subsystem == "com.apple.CFNetwork")' \
+            > "$RUNNER_TEMP/sim-network.log" 2>&1 &
+      # First, since it also warms up the simulator: right after boot, the first minute of connections from the Dart
+      # suite stalled before the TLS handshake on every run, and passed when the suite ran again.
+      - name: Native bridge tests (XCTest)
+        id: native
+        timeout-minutes: 5
+        env:
+          FLUTTER: flutter
+          SUITES: native
+          QLOGDIR: ${{ runner.temp }}/qlog/native
+        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
+      # Runs after a failed native suite too, but not when setup failed and the native suite never ran.
+      - name: Dart integration tests
+        if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
+        timeout-minutes: 10
+        env:
+          FLUTTER: flutter
+          SUITES: dart
+          QLOGDIR: ${{ runner.temp }}/qlog/dart
+        # DEBUG -v: flutter test once launched the app and then waited 13 minutes without connecting to it; verbose
+        # output shows what it waits on.
+        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}" -v
+      - name: Upload logs
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-integration-logs
+          path: |
+            build/integration_test_*.log
+            ${{ runner.temp }}/sim-network.log
+            ${{ runner.temp }}/qlog
+          if-no-files-found: ignore
+
+  android-integration:
+    name: Android integration tests (emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ANDROID_API_LEVEL: 34
+      # Set explicitly, so avdmanager, the config edit below and the emulator all use the same directory.
+      ANDROID_AVD_HOME: /home/runner/.android/avd
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+      - parallel:
+          # The emulator needs several GB free for its userdata partition, more than some runners have left.
+          - name: Free disk space
+            timeout-minutes: 5
+            run: |
+              df -h /
+              sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+              df -h /
+          - name: Enable KVM
+            timeout-minutes: 2
+            run: |
+              echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+                sudo tee /etc/udev/rules.d/99-kvm4all.rules
+              sudo udevadm control --reload-rules
+              sudo udevadm trigger --name-match=kvm
+          - name: Cache emulator system image
+            uses: actions/cache@v6
+            timeout-minutes: 5
+            with:
+              path: /usr/local/lib/android/sdk/system-images/android-${{ env.ANDROID_API_LEVEL }}
+              key: android-system-image-${{ env.ANDROID_API_LEVEL }}-google_apis-x86_64
+          # Gradle's build cache (org.gradle.caching in example/android/gradle.properties): task outputs by content
+          # hash. setup-java's cache holds only the dependencies, and never saves again once its key exists.
+          - name: Cache Gradle build outputs
+            uses: actions/cache@v6
+            timeout-minutes: 5
+            with:
+              path: ~/.gradle/caches/build-cache-1
+              key: gradle-build-cache-${{ hashFiles('.fvmrc', 'pubspec.yaml', 'lib/**', 'android/**', 'example/pubspec.yaml', 'example/lib/**', 'example/android/**', 'example/integration_test/**') }}
+              restore-keys: gradle-build-cache-
+      - parallel:
+          # Leaves the emulator booting in the background, through the builds below; "Wait for emulator" joins it.
+          # Two of the runner's four cores go to the emulator and the rest to Gradle.
+          - name: Start emulator
+            timeout-minutes: 5
+            run: |
+              image="system-images;android-$ANDROID_API_LEVEL;google_apis;x86_64"
+              tools="$ANDROID_HOME/cmdline-tools/latest/bin"
+              yes | "$tools/sdkmanager" --licenses > /dev/null
+              "$tools/sdkmanager" --install emulator "$image" > /dev/null
+              mkdir -p "$ANDROID_AVD_HOME"
+              echo no | "$tools/avdmanager" create avd --force -n ci -k "$image"
+              "$tools/avdmanager" list avd
+              printf 'hw.cpu.ncore=2\ndisk.dataPartition.size=4096M\n' >> "$ANDROID_AVD_HOME/ci.avd/config.ini"
+              nohup "$ANDROID_HOME/emulator/emulator" -avd ci -port 5554 -no-window -gpu swiftshader_indirect \
+                -no-snapshot -noaudio -no-boot-anim -no-metrics > "$RUNNER_TEMP/emulator.log" 2>&1 &
+              echo "$!" > "$RUNNER_TEMP/emulator.pid"
+          - uses: actions/setup-java@v6
+            timeout-minutes: 5
+            with:
+              distribution: temurin
+              java-version: "17"
+              cache: gradle
+          - uses: actions/setup-go@v7
+            timeout-minutes: 5
+            with:
+              go-version-file: test_server/go.mod
+              cache-dependency-path: test_server/go.sum
+          - name: Set up Flutter from .fvmrc
+            uses: kuhnroyal/flutter-fvm-config-action/setup@v3
+            timeout-minutes: 10
+      # Both APKs trust the test server's CA from res/raw, so it must exist to build them. The server creates it on
+      # first start and reuses it after, so the CA built in here is the one the tests' server uses.
+      - name: Generate test server CA
+        timeout-minutes: 5
+        run: |
+          (cd test_server && go build -o connect-native-http-test-server .)
+          test_server/connect-native-http-test-server -addr :8443 -hosts 10.0.2.2.nip.io -certdir test_server/certs \
+            -admin-addr :8081 &
+          server=$!
+          for _ in $(seq 100); do
+            if curl -sf -X POST http://localhost:8081/unfreeze >/dev/null; then break; fi
+            sleep 0.1
+          done
+          kill "$server"
+          wait "$server" || true
+          for dir in example/android/app/src/main/res/raw android/src/androidTest/res/raw; do
+            mkdir -p "$dir"
+            cp test_server/certs/ca.pem "$dir/test_server_ca.pem"
+          done
+      - name: Build example app
+        timeout-minutes: 8
+        working-directory: example
+        run: flutter build apk --debug
+      - name: Build plugin instrumented tests
+        timeout-minutes: 4
+        working-directory: example/android
+        run: ./gradlew :connect_native_http:assembleDebugAndroidTest
+      - name: Wait for emulator
+        id: emulator
+        timeout-minutes: 5
+        run: |
+          adb="$ANDROID_HOME/platform-tools/adb"
+          until [[ "$("$adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]]; do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/emulator.pid")" 2>/dev/null; then
+              echo "emulator exited:" >&2
+              tail -50 "$RUNNER_TEMP/emulator.log" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          for setting in window_animation_scale transition_animation_scale animator_duration_scale; do
+            "$adb" -s emulator-5554 shell settings put global "$setting" 0
+          done
+          # The emulator logs everything verbosely (androidboot.logcat=*:V) and tries to raise the buffer to 2M
+          # itself, but its adb call fails while the device is still offline. A small buffer wraps within seconds.
+          "$adb" -s emulator-5554 logcat -G 16M
+      # The device's view of the app launch, uploaded below: flutter test finds the app's VM service in logcat, and
+      # once installed the app and then waited 8 minutes without connecting to it.
+      - name: Record logcat
+        timeout-minutes: 2
+        run: |
+          nohup "$ANDROID_HOME/platform-tools/adb" -s emulator-5554 logcat -v threadtime \
+            > "$RUNNER_TEMP/logcat.log" 2>&1 &
+      - name: Dart integration tests
+        timeout-minutes: 8
+        env:
+          FLUTTER: flutter
+          SUITES: dart
+        # DEBUG -v: shows what flutter test waits on when it doesn't connect to the app (see Record logcat).
+        run: ./run_integration_tests.sh android emulator-5554 -v
+      # Runs after a failed Dart suite too, but not when the emulator never came up.
+      - name: Native bridge tests (instrumented)
+        if: ${{ !cancelled() && steps.emulator.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          FLUTTER: flutter
+          SUITES: native
+        run: ./run_integration_tests.sh android emulator-5554
+      - name: Upload logs
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-integration-logs
+          path: |
+            build/integration_test_*.log
+            ${{ runner.temp }}/emulator.log
+            ${{ runner.temp }}/logcat.log
+          if-no-files-found: ignore
+
+  # The one check to mark as required. It runs even when a job it needs fails, so it reports failure instead of
+  # being skipped, which branch protection would count as passing.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs:
+      - dart
+      - test-server
+      - swift-core
+      - ios-integration
+      - android-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check that every job succeeded
+        timeout-minutes: 2
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            if [[ "$result" != success ]]; then
+              exit 1
+            fi
+          done
