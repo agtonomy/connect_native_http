@@ -69,10 +69,8 @@ public final class URLSessionBridge {
         // URLSession fails a task that receives nothing for this long. Its default of 60 s would end a quiet stream
         // or a long-running unary call; callers bound calls with deadlines instead.
         configuration.timeoutIntervalForRequest = 24 * 60 * 60
-        // Only a bridge with its own roots implements the trust challenge. With the system's roots the network stack
-        // checks certificates itself; a delegate that implements the challenge makes every TLS handshake, QUIC and
-        // TCP alike, wait for an answer from `queue` first. At app launch on CI that answer once took 126 ms while
-        // the QUIC handshake waited, and URLSession's TCP attempt won the race.
+        // Only a bridge with its own roots implements the trust challenge. With the system's roots there is nothing
+        // for the delegate to decide, so certificate checks are left entirely to the network stack.
         let delegate = self.trustedRoots.isEmpty ? Delegate(bridge: self) : TrustingDelegate(bridge: self)
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: self.delegateQueue)
         let id = self.nextSessionId
