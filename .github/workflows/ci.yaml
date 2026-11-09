@@ -209,9 +209,7 @@ jobs:
           FLUTTER: flutter
           SUITES: dart
           QLOGDIR: ${{ runner.temp }}/qlog/dart
-        # DEBUG -v: flutter test once launched the app and then waited 13 minutes without connecting to it; verbose
-        # output shows what it waits on.
-        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}" -v
+        run: ./run_integration_tests.sh ios "${{ steps.simulator.outputs.udid }}"
       - name: Upload logs
         if: always()
         timeout-minutes: 2
@@ -354,8 +352,7 @@ jobs:
         env:
           FLUTTER: flutter
           SUITES: dart
-        # DEBUG -v: shows what flutter test waits on when it doesn't connect to the app (see Record logcat).
-        run: ./run_integration_tests.sh android emulator-5554 -v
+        run: ./run_integration_tests.sh android emulator-5554
       # Runs after a failed Dart suite too, but not when the emulator never came up.
       - name: Native bridge tests (instrumented)
         if: ${{ !cancelled() && steps.emulator.outcome == 'success' }}

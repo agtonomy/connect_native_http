@@ -89,8 +89,10 @@ class CronetBridgeTest {
         ))
     }
 
+    // Each case opens a fresh connection to the host through the emulator, which once took 3 s to come up on CI (the
+    // request reached the server just as a 3 s wait gave up). 10 s, like the Dart cases, still fails a real hang fast.
     private fun await(callId: Int, vararg types: String): Map<String, Any?> {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
         while (true) {
             events.firstOrNull { it["callId"] == callId && it["type"] in types }?.let { return it }
             val left = deadline - System.nanoTime()
