@@ -10,6 +10,7 @@ public final class URLSessionBridge {
   }
 
   private let emit: ([String: Any]) -> Void
+  private let trustedRoots: [SecCertificate]
 
   // URLSession delegate callbacks and all state below run on this queue, so none of it needs locking.
   private let queue = DispatchQueue(label: "connect_native_http")
@@ -48,7 +49,13 @@ public final class URLSessionBridge {
     }
   }
 
-  public init(emit: @escaping ([String: Any]) -> Void) {
+  public convenience init(emit: @escaping ([String: Any]) -> Void) {
+    self.init(trustedRoots: [], emit: emit)
+  }
+
+  /// `trustedRoots`, when not empty, replaces the system trust store; tests use it for their own CA.
+  init(trustedRoots: [SecCertificate], emit: @escaping ([String: Any]) -> Void) {
+    self.trustedRoots = trustedRoots
     self.emit = emit
   }
 
@@ -216,22 +223,39 @@ public final class URLSessionBridge {
     emit(failure(c.callId, domain: error.domain, code: error.code, message: error.localizedDescription))
   }
 
+  fileprivate func serverTrust(_ challenge: URLAuthenticationChallenge) -> (
+    URLSession.AuthChallengeDisposition, URLCredential?
+  ) {
+    guard !trustedRoots.isEmpty,
+      challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+      let trust = challenge.protectionSpace.serverTrust
+    else {
+      return (.performDefaultHandling, nil)
+    }
+    SecTrustSetAnchorCertificates(trust, trustedRoots as CFArray)
+    SecTrustSetAnchorCertificatesOnly(trust, true)
+    return SecTrustEvaluateWithError(trust, nil)
+      ? (.useCredential, URLCredential(trust: trust)) : (.cancelAuthenticationChallenge, nil)
+  }
+
   // 64 KiB, the bound pair's buffer: how much request body may wait for URLSession to read it.
   private static let bodyBufferBytes = 64 * 1024
 }
 
 // URLSession keeps its delegate until the session is invalidated, so this holds the bridge weakly.
-//
-// It deliberately has no authentication challenge method: certificates are checked against the system trust store
-// only, inside the network stack. A delegate that implements the challenge at all gets every TLS handshake's
-// certificate check, QUIC and TCP alike, sent through `queue`, behind every call's callbacks; on a loaded device that
-// held a QUIC handshake long enough for URLSession's TCP attempt to win the race. Tests trust their server's CA by
-// installing it in the device's (or Mac's) trust store.
 private final class Delegate: NSObject, URLSessionDataDelegate {
   weak var bridge: URLSessionBridge?
 
   init(bridge: URLSessionBridge) {
     self.bridge = bridge
+  }
+
+  func urlSession(
+    _ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+  ) {
+    let (disposition, credential) = bridge?.serverTrust(challenge) ?? (.performDefaultHandling, nil)
+    completionHandler(disposition, credential)
   }
 
   func urlSession(

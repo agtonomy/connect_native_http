@@ -155,7 +155,7 @@ if [[ " $SUITES " == *" native "* ]]; then
       # when CI has already run it.
       with_timeout 300 "$ROOT/ios/connect_native_http/build_core_tests.sh" "$ROOT/build/ios_core_tests"
       # The tests take about a second.
-      with_timeout 60 env SIMCTL_CHILD_SERVER_URL="$SERVER_URL" \
+      with_timeout 60 env SIMCTL_CHILD_SERVER_URL="$SERVER_URL" SIMCTL_CHILD_SERVER_CA="$ROOT/test_server/certs/ca.der" \
         xcrun simctl spawn "$DEVICE" \
         "$(xcrun --sdk iphonesimulator --show-sdk-platform-path)/Developer/Library/Xcode/Agents/xctest" \
         "$ROOT/build/ios_core_tests/Build/Products/Debug-iphonesimulator/ConnectNativeHttpCoreTests.xctest"
