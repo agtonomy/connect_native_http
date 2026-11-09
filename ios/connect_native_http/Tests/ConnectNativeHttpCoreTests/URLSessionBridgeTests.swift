@@ -89,17 +89,53 @@ final class URLSessionBridgeTests: XCTestCase {
     XCTAssertEqual(outcome(2)?["domain"] as? String, "ConnectNativeHttp")
   }
 
+  func testMalformedArgumentsAreRefusedInsteadOfCrashing() async throws {
+    let malformed: [(String, [String: Any])] = [
+      ("open", [:]),
+      ("open", ["engineId": "1", "callId": 1, "url": serverURL, "method": "POST", "headers": [[String]](), "hasBody": true]),
+      ("open", ["engineId": 1, "callId": 1, "url": serverURL, "method": "POST", "headers": [["one"]], "hasBody": true]),
+      ("write", ["callId": 1, "data": "not bytes"]),
+      ("end", ["callId": "1"]),
+      ("cancel", [:]),
+      ("shutdownEngine", ["engineId": NSNull()]),
+      ("createEngine", ["http3Origins": [["localhost"]]]),
+    ]
+    for (method, arguments) in malformed {
+      let result = await reply(method, arguments)
+      guard case .error(let code, _) = result else {
+        XCTFail("\(method) \(arguments): \(result)")
+        continue
+      }
+      XCTAssertEqual(code, "badArguments")
+    }
+    // The bridge still works afterwards.
+    let engine = try await createEngine()
+    try await open(engine, callId: 1, path: Self.say, contentType: "application/proto")
+    try await write(1, sentence("hi"))
+    try await invoke("end", ["callId": 1])
+    try await waitUntil("the call ended") { self.outcome(1) != nil }
+    XCTAssertEqual(outcome(1)?["type"] as? String, "done", "\(String(describing: outcome(1)))")
+  }
+
   // MARK: Bridge calls
+
+  private func reply(_ method: String, _ arguments: [String: Any]) async -> URLSessionBridge.Reply {
+    await withCheckedContinuation { (done: CheckedContinuation<URLSessionBridge.Reply, Never>) in
+      bridge.handle(method, arguments) { done.resume(returning: $0) }
+    }
+  }
 
   @discardableResult
   private func invoke(_ method: String, _ arguments: [String: Any]) async throws -> Any? {
-    let reply = await withCheckedContinuation { (done: CheckedContinuation<URLSessionBridge.Reply, Never>) in
-      bridge.handle(method, arguments) { done.resume(returning: $0) }
-    }
-    guard case .success(let value) = reply else {
+    switch await reply(method, arguments) {
+    case .success(let value):
+      return value
+    case .error(let code, let message):
+      XCTFail("\(method): \(code): \(message)")
+      throw CancellationError()
+    case .notImplemented:
       throw XCTSkip("\(method) is not implemented")
     }
-    return value
   }
 
   private func createEngine() async throws -> Int {

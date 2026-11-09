@@ -13,6 +13,9 @@ import 'url_session/url_session_http_client.dart';
 /// Requests fail with a `ConnectException` of code `unavailable` whose `cause` is a [NativeHttpException].
 abstract interface class NativeHttpClient {
   /// The client for this platform, or `null` where there is none (anything but iOS and Android).
+  ///
+  /// Throws a `PlatformException` if the platform can't create one, such as when Android fails to load Cronet's native
+  /// library. An app can fall back to another `HttpClient` then.
   static Future<NativeHttpClient?> create([NativeHttpConfig config = const NativeHttpConfig()]) async {
     if (Platform.isIOS) {
       return UrlSessionHttpClient.create(config);

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:connect_native_http/connect_native_http.dart';
 import 'package:connect_native_http/src/cronet/cronet_http_client.dart';
 import 'package:connectrpc/connect.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -11,12 +12,18 @@ class FakePlugin {
   FakePlugin() {
     _messenger.setMockMethodCallHandler(cronetMethodChannel, (call) async {
       calls.add(call);
+      if (refusing.contains(call.method)) {
+        throw PlatformException(code: 'badArguments', message: '${call.method} refused');
+      }
       return call.method == 'createEngine' ? 7 : null;
     });
     _messenger.setMockMethodCallHandler(MethodChannel(cronetEventChannel.name), (call) async => null);
   }
 
   final calls = <MethodCall>[];
+
+  /// Methods the plugin answers with an error.
+  final refusing = <String>{};
 
   TestDefaultBinaryMessenger get _messenger => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
 
@@ -298,5 +305,94 @@ void main() {
   test('close shuts the engine down', () async {
     await client.close();
     expect(plugin.callsTo('shutdownEngine').single.arguments['engineId'], 7);
+  });
+
+  group('errors end the call they concern, and nothing else', () {
+    final reported = <FlutterErrorDetails>[];
+    late FlutterExceptionHandler? previousOnError;
+
+    setUp(() {
+      reported.clear();
+      previousOnError = FlutterError.onError;
+      FlutterError.onError = reported.add;
+    });
+
+    tearDown(() => FlutterError.onError = previousOnError);
+
+    Future<void> expectSayWorks() async {
+      final response = client.httpClient(request(null));
+      await settle();
+      await plugin.headers(plugin.lastCallId);
+      expect((await response).status, 200);
+    }
+
+    test('an onResponse callback that throws is reported, and the call goes on', () async {
+      final throwing = await CronetHttpClient.create(NativeHttpConfig(onResponse: (_) => throw StateError('oops')));
+      final responseFuture = throwing.httpClient(request(null));
+      await settle();
+      await plugin.headers(plugin.lastCallId);
+      final response = await responseFuture.timeout(const Duration(seconds: 1));
+      expect(response.status, 200);
+      expect(reported.single.exception, isA<StateError>());
+    });
+
+    test('a plugin that refuses to open the call fails it as never sent', () async {
+      plugin.refusing.add('open');
+      final cause = await failureCause(client.httpClient(request(Stream.value(Uint8List.fromList([1])))));
+      expect(cause.failure, NativeHttpFailure.notSent);
+      expect(cause.message, contains('open refused'));
+      await settle();
+      expect(plugin.callsTo('write'), isEmpty);
+      plugin.refusing.clear();
+      await expectSayWorks();
+    });
+
+    test('a plugin that refuses a chunk cancels the call', () async {
+      plugin.refusing.add('write');
+      final response = client.httpClient(request(Stream.value(Uint8List.fromList([1]))));
+      await settle();
+      await settle();
+      final id = plugin.lastCallId;
+      expect(plugin.callsTo('cancel').single.arguments['callId'], id);
+      await plugin.emit({'callId': id, 'type': 'canceled'});
+      await expectLater(response, throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.internal)));
+    });
+
+    test('a cancel the plugin refuses still ends the call', () async {
+      plugin.refusing.add('cancel');
+      final signal = CancelableSignal();
+      final response = client.httpClient(request(StreamController<Uint8List>().stream, signal: signal));
+      await settle();
+      signal.cancel('stop');
+      await expectLater(
+        response.timeout(const Duration(seconds: 1)),
+        throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.canceled)),
+      );
+      expect(reported.single.exception, isA<PlatformException>());
+    });
+
+    test('a malformed event fails its own call, and other calls carry on', () async {
+      final other = client.httpClient(request(null));
+      await settle();
+      final otherId = plugin.lastCallId;
+
+      final broken = client.httpClient(request(null));
+      await settle();
+      final brokenId = plugin.lastCallId;
+      await plugin.emit({'callId': brokenId, 'type': 'headers', 'status': 'two hundred', 'headers': <Object>[]});
+      await expectLater(broken, throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.internal)));
+      await settle();
+      expect(plugin.callsTo('cancel').single.arguments['callId'], brokenId);
+      expect(reported, hasLength(1));
+
+      await plugin.headers(otherId);
+      expect((await other).status, 200);
+    });
+
+    test('an event that names no call is reported and ignored', () async {
+      await plugin.emit({'type': 'data'});
+      expect(reported, hasLength(1));
+      await expectSayWorks();
+    });
   });
 }
