@@ -137,6 +137,25 @@ void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   late Harness harness;
 
+  // One call on a throwaway client before any case. Right after the app launches, the simulator and the test server
+  // on the same CI runner are both slow (a QUIC connection took 66 ms to set up, and the server answered its first
+  // packet 130 ms after it was sent), so the first call's QUIC attempt loses URLSession's race to TCP. The cases then
+  // start on a warm app and server. The protocol it got is logged, not checked.
+  setUpAll(() async {
+    if (serverUrl.isEmpty) {
+      return; // setUp reports it.
+    }
+    final warmup = await Harness.create(serverUrl, http3Origins: {Uri.parse(serverUrl)});
+    try {
+      await warmup.eliza
+          .say(SayRequest(sentence: 'warm up'), onHeader: warmup.recordHeaders)
+          .timeout(const Duration(seconds: 10));
+      debugPrint('warm-up call went over ${warmup.serverProtocols.single}');
+    } finally {
+      await warmup.native.close();
+    }
+  });
+
   setUp(() async {
     expect(serverUrl, isNotEmpty, reason: 'run with --dart-define=SERVER_URL=...');
     final origin = Uri.parse(serverUrl);
