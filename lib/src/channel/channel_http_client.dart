@@ -150,7 +150,7 @@ final class _Dispatcher {
       id = (event! as Map)['callId']! as int;
       call = calls[id];
     } catch (error, stack) {
-      reportError(error, stack, 'while reading a ${bridge.name} event: $event');
+      reportError(error, stack, 'while reading a ${bridge.name} event (${event.runtimeType})');
       return;
     }
     if (call == null) {
@@ -163,7 +163,8 @@ final class _Dispatcher {
       remove(id);
       call.fail(ConnectException(Code.internal, '${bridge.name}: bad event: $error', cause: error));
       unawaited(cancel(id));
-      reportError(error, stack, 'while handling a ${bridge.name} event: $event');
+      // The event's type only: its body bytes and headers can be large, and private.
+      reportError(error, stack, "while handling a ${bridge.name} '${(event as Map)['type']}' event for call $id");
     }
   }
 

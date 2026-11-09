@@ -39,7 +39,7 @@ whether the request provably never left the device (`requestNeverSent`), which m
 | `untrusted` | -1201 to -1204, certificate rejected | `net::` certificate errors -200 to -299, or a pin mismatch (-150) |
 | `other` | Everything else, timeouts and dropped connections included | Any failure after `onStreamReady` |
 
-Nothing the package does should crash the app or leave a call hanging. Failures end the one call they concern:
+No exception in the package should crash the app or leave a call hanging. Failures end the one call they concern:
 
 - **A request the platform stack rejects** fails that call as `notSent`. For example, Cronet throws on a header value
   with a line break.

@@ -79,11 +79,12 @@ class CronetBridge(
     // Handles one method call. [reply] is called on the main thread, and arguments Dart got wrong are refused with an
     // error reply rather than thrown on it.
     fun handle(method: String, args: Map<String, Any?>, reply: (Reply) -> Unit) {
-        val result = { r: Reply -> main.post { reply(r) } }
+        val result: (Reply) -> Unit = { r -> main.post { reply(r) } }
         try {
             dispatch(method, args, result)
         } catch (e: Exception) {
-            Log.e(TAG, "$method: bad arguments $args", e)
+            // Not the arguments themselves: an open's include the request headers, credentials among them.
+            Log.e(TAG, "$method: bad arguments", e)
             result(Reply.Error("badArguments", "$method: ${e.message}"))
         }
     }
