@@ -9,6 +9,7 @@ import 'package:connect_native_http_example/gen/connectrpc/eliza/v1/eliza.pb.dar
 import 'package:connectrpc/connect.dart';
 import 'package:connectrpc/protobuf.dart';
 import 'package:connectrpc/protocol/connect.dart' as connect_protocol;
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
@@ -89,26 +90,31 @@ Future<(StreamController<ConverseRequest>, StreamIterator<ConverseResponse>)> op
   return (requests, responses);
 }
 
-/// A client whose pooled connection to the server negotiated HTTP/3, for the cases that only apply over QUIC.
+/// A client whose pooled connection to the server negotiated [protocol], such as `HTTP/3.0`.
 ///
 /// URLSession races QUIC against TCP for each new connection and keeps whichever connects first, so on a loaded
 /// device a connection sometimes lands on HTTP/2 even for an HTTP/3 origin. A client keeps reusing the connection it
-/// has, so each attempt uses a fresh client, closing the ones that got HTTP/2.
-Future<Harness> harnessOverHttp3() async {
+/// has, so each attempt uses a fresh client, closing the ones that got another protocol. Each attempt is that
+/// client's first call, before any Alt-Svc: reaching HTTP/3 shows the client tried QUIC because of http3Origins.
+Future<Harness> harnessNegotiating(String protocol) async {
   final deadline = DateTime.now().add(const Duration(seconds: 5));
   final protocols = <String>[];
   while (true) {
     final harness = await Harness.create(serverUrl, http3Origins: {Uri.parse(serverUrl)});
     await harness.eliza.say(SayRequest(sentence: 'which protocol'), onHeader: harness.recordHeaders);
-    final protocol = harness.serverProtocols.last;
-    if (protocol == 'HTTP/3.0') {
+    final negotiated = harness.serverProtocols.last;
+    if (negotiated == protocol) {
+      if (protocols.isNotEmpty) {
+        // Not a failure, but worth seeing in CI's log: how often a local HTTP/3 connection lost the race to TCP.
+        debugPrint('negotiated $protocol after ${protocols.length} other connections: $protocols');
+      }
       addTearDown(harness.native.close);
       return harness;
     }
-    protocols.add(protocol);
+    protocols.add(negotiated);
     await harness.native.close();
     if (DateTime.now().isAfter(deadline)) {
-      fail('no connection negotiated HTTP/3 in ${protocols.length} attempts: $protocols');
+      fail('no connection negotiated $protocol in ${protocols.length} attempts: $protocols');
     }
   }
 }
@@ -130,6 +136,25 @@ Future<NativeHttpException> nativeCause(Future<Object?> call) async {
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   late Harness harness;
+
+  // One call on a throwaway client before any case. Right after the app launches, the simulator and the test server
+  // on the same CI runner are both slow (a QUIC connection took 66 ms to set up, and the server answered its first
+  // packet 130 ms after it was sent), so the first call's QUIC attempt loses URLSession's race to TCP. The cases then
+  // start on a warm app and server. The protocol it got is logged, not checked.
+  setUpAll(() async {
+    if (serverUrl.isEmpty) {
+      return; // setUp reports it.
+    }
+    final warmup = await Harness.create(serverUrl, http3Origins: {Uri.parse(serverUrl)});
+    try {
+      await warmup.eliza
+          .say(SayRequest(sentence: 'warm up'), onHeader: warmup.recordHeaders)
+          .timeout(const Duration(seconds: 10));
+      debugPrint('warm-up call went over ${warmup.serverProtocols.single}');
+    } finally {
+      await warmup.native.close();
+    }
+  });
 
   setUp(() async {
     expect(serverUrl, isNotEmpty, reason: 'run with --dart-define=SERVER_URL=...');
@@ -227,28 +252,10 @@ void main() {
       markTestSkipped('EXPECT_PROTOCOL not set');
       return;
     }
-    // URLSession only moves to HTTP/3 on a new connection after an Alt-Svc response, so keep calling for a while.
-    final deadline = DateTime.now().add(const Duration(seconds: 5));
-    while (DateTime.now().isBefore(deadline) && !harness.serverProtocols.contains(expectedProtocol)) {
-      await harness.eliza.say(SayRequest(sentence: 'which protocol'), onHeader: harness.recordHeaders);
-      await Future<void>.delayed(const Duration(milliseconds: 500));
-    }
-    expect(
-      harness.serverProtocols,
-      contains(expectedProtocol),
-      reason: 'server saw ${harness.serverProtocols}; platform reported ${harness.platformProtocols}',
-    );
-  });
-
-  testCase('the first call to an HTTP/3 origin goes over HTTP/3', (_) async {
-    if (expectedProtocol != 'HTTP/3.0') {
-      markTestSkipped('needs EXPECT_PROTOCOL=HTTP/3.0');
-      return;
-    }
-    // The origin is in http3Origins, so the client tries QUIC from its first connection. Real networks can block or
-    // slow QUIC and fall back to TCP, but on this local path a fallback means something is wrong.
-    await harness.eliza.say(SayRequest(sentence: 'first'), onHeader: harness.recordHeaders);
-    expect(harness.serverProtocols.single, 'HTTP/3.0', reason: 'the first connection fell back to TCP');
+    // Fresh clients, since one that connected over HTTP/2 keeps that connection. A loaded simulator sometimes lets
+    // TCP win the race even on this local path (a QUIC handshake held 150 ms in certificate verification while TCP
+    // started 100 ms in and finished first), so one fallback isn't a failure; never reaching HTTP/3 is.
+    await harnessNegotiating(expectedProtocol);
   });
 
   // The idle-timeout cases freeze the server's UDP path, so they only apply where calls go over HTTP/3.
@@ -260,14 +267,14 @@ void main() {
     return false;
   }
 
-  // Up to 5 s of harnessOverHttp3 on top of the case itself, which waits up to 7 s for the idle timeout.
+  // Up to 5 s of harnessNegotiating on top of the case itself, which waits up to 7 s for the idle timeout.
   const http3CaseTimeout = Duration(seconds: 20);
 
   testCase('a quiet HTTP/3 stream outlives the idle timeout while the server pings', (_) async {
     if (skipUnlessHttp3()) {
       return;
     }
-    final h3 = await harnessOverHttp3();
+    final h3 = await harnessNegotiating('HTTP/3.0');
     final (requests, responses) = await openQuietConverse(h3);
     expect(h3.serverProtocols.last, 'HTTP/3.0');
     await Future<void>.delayed(serverMaxIdle * 2);
@@ -283,7 +290,7 @@ void main() {
     if (skipUnlessHttp3()) {
       return;
     }
-    final h3 = await harnessOverHttp3();
+    final h3 = await harnessNegotiating('HTTP/3.0');
     final hold = serverMaxIdle * 2 + const Duration(seconds: 1);
     final res = await h3.eliza.say(
       SayRequest(sentence: 'sleep:${hold.inMilliseconds}'),
@@ -298,7 +305,7 @@ void main() {
     if (skipUnlessHttp3()) {
       return;
     }
-    final h3 = await harnessOverHttp3();
+    final h3 = await harnessNegotiating('HTTP/3.0');
     final (requests, responses) = await openQuietConverse(h3);
     expect(h3.serverProtocols.last, 'HTTP/3.0');
     addTearDown(() => admin('/unfreeze'));

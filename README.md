@@ -206,8 +206,9 @@ Neither platform finishes a stream on its own while the client still has its req
 
   It covers unary calls, errors, deadlines, server streaming, and full-duplex bidi where the server speaks first and
   finishes first. It also checks the failure classes (`notSent`, `untrusted`) and the negotiated protocol: HTTP/3 on
-  iOS, and HTTP/2 on Android, since the server's private CA keeps Cronet off QUIC. On iOS a fresh client's first call
-  must already be HTTP/3: on this local path, a fallback to TCP is a failure.
+  iOS, and HTTP/2 on Android, since the server's private CA keeps Cronet off QUIC. On iOS a fresh client's first call,
+  before any Alt-Svc, must reach HTTP/3 within a few fresh clients. A loaded simulator sometimes lets TCP win
+  URLSession's race even locally, so a single fallback is logged rather than failed.
 
   The script starts the server with a 3 s idle timeout and 1 s pings. Over HTTP/3 (iOS) the tests also check two
   things: a quiet stream outlives the idle timeout, and a frozen path fails an open stream within it.

@@ -183,12 +183,13 @@ jobs:
           # Every step targets $udid; anything else booted could answer in its place.
           xcrun simctl list devices booted
       # The network stack's view of every connection the tests make (QUIC vs TCP races, handshakes), uploaded below.
-      # Cheap, and the only way to see why a connection stalled or fell back to HTTP/2.
+      # Cheap, and the only way to see why a connection stalled or fell back to HTTP/2. trustd too: certificate
+      # evaluation happens there, and in run 42427208429 one took 151 ms (2-10 ms usually) and let TCP win the race.
       - name: Record the simulator's network log
         timeout-minutes: 2
         run: |
           nohup xcrun simctl spawn "${{ steps.simulator.outputs.udid }}" log stream --level debug --style compact \
-            --predicate '(process == "Runner" OR process == "xctest") AND (subsystem == "com.apple.network" OR subsystem == "com.apple.CFNetwork")' \
+            --predicate '((process == "Runner" OR process == "xctest") AND (subsystem == "com.apple.network" OR subsystem == "com.apple.CFNetwork")) OR process == "trustd"' \
             > "$RUNNER_TEMP/sim-network.log" 2>&1 &
       # First, since it also warms up the simulator: right after boot, the first minute of connections from the Dart
       # suite stalled before the TLS handshake on every run, and passed when the suite ran again.
