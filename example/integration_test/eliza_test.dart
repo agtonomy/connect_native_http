@@ -141,19 +141,34 @@ void main() {
   // on the same CI runner are both slow (a QUIC connection took 66 ms to set up, and the server answered its first
   // packet 130 ms after it was sent), so the first call's QUIC attempt loses URLSession's race to TCP. The cases then
   // start on a warm app and server. The protocol it got is logged, not checked.
+  //
+  // A few attempts, each on a fresh client whose call a deadline cancels: on a freshly booted simulator, trustd can
+  // stall every certificate check for a while (once while it updated its pinning database from a trust data update).
+  // Three 8 s attempts stay inside the test framework's 30 s default timeout.
   setUpAll(() async {
     if (serverUrl.isEmpty) {
       return; // setUp reports it.
     }
-    final warmup = await Harness.create(serverUrl, http3Origins: {Uri.parse(serverUrl)});
-    try {
-      await warmup.eliza
-          .say(SayRequest(sentence: 'warm up'), onHeader: warmup.recordHeaders)
-          .timeout(const Duration(seconds: 10));
-      debugPrint('warm-up call went over ${warmup.serverProtocols.single}');
-    } finally {
-      await warmup.native.close();
+    const attempts = 3;
+    final errors = <Object>[];
+    for (var attempt = 1; attempt <= attempts; attempt++) {
+      final warmup = await Harness.create(serverUrl, http3Origins: {Uri.parse(serverUrl)});
+      try {
+        await warmup.eliza.say(
+          SayRequest(sentence: 'warm up'),
+          signal: TimeoutSignal(const Duration(seconds: 8)),
+          onHeader: warmup.recordHeaders,
+        );
+        debugPrint('warm-up call $attempt went over ${warmup.serverProtocols.single}');
+        return;
+      } on ConnectException catch (e) {
+        debugPrint('warm-up call $attempt failed: $e');
+        errors.add(e);
+      } finally {
+        await warmup.native.close();
+      }
     }
+    fail('no warm-up call succeeded in $attempts attempts: $errors');
   });
 
   setUp(() async {
