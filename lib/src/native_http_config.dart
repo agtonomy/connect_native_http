@@ -29,6 +29,7 @@ final class NativeHttpConfig {
   /// Android only. URLSession exposes no QUIC settings, so on iOS only the server's advertised idle timeout applies.
   final Duration? quicIdleTimeout;
 
-  /// Called with each response's headers, before its body is read.
+  /// Called with each response's headers, before its body is read. An exception it throws goes to
+  /// `FlutterError.onError`, and the call goes on.
   final void Function(NativeHttpResponseInfo info)? onResponse;
 }

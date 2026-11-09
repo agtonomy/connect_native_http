@@ -6,7 +6,14 @@ import Foundation
 public final class URLSessionBridge {
   public enum Reply {
     case success(Any?)
+    /// The call's arguments were not what the method takes. Refused rather than force-unwrapped, which would crash the
+    /// app.
+    case error(code: String, message: String)
     case notImplemented
+  }
+
+  private struct BadArgument: Error {
+    let name: String
   }
 
   private let emit: ([String: Any]) -> Void
@@ -61,9 +68,27 @@ public final class URLSessionBridge {
 
   /// Handles one method call. `reply` may be called on any thread.
   public func handle(_ method: String, _ args: [String: Any], reply: @escaping (Reply) -> Void) {
+    do {
+      try dispatch(method, args, reply: reply)
+    } catch let bad as BadArgument {
+      reply(.error(code: "badArguments", message: "\(method): missing or mistyped argument \(bad.name)"))
+    } catch {
+      reply(.error(code: "badArguments", message: "\(method): \(error)"))
+    }
+  }
+
+  private func arg<T>(_ args: [String: Any], _ name: String) throws -> T {
+    guard let value = args[name] as? T else { throw BadArgument(name: name) }
+    return value
+  }
+
+  private func dispatch(_ method: String, _ args: [String: Any], reply: @escaping (Reply) -> Void) throws {
     switch method {
     case "createEngine":
-      let origins = (args["http3Origins"] as? [[Any]] ?? []).map { "\($0[0]):\($0[1])" }
+      let origins = try (args["http3Origins"] as? [[Any]] ?? []).map { origin -> String in
+        guard origin.count == 2 else { throw BadArgument(name: "http3Origins") }
+        return "\(origin[0]):\(origin[1])"
+      }
       queue.async {
         let configuration = URLSessionConfiguration.ephemeral
         // URLSession fails a task that receives nothing for this long. Its default of 60 s would end a quiet stream
@@ -79,23 +104,24 @@ public final class URLSessionBridge {
         reply(.success(id))
       }
     case "shutdownEngine":
-      let engineId = args["engineId"] as! Int
+      let engineId: Int = try arg(args, "engineId")
       queue.async {
         self.sessions.removeValue(forKey: engineId)?.urlSession.finishTasksAndInvalidate()
       }
       reply(.success(nil))
     case "open":
-      let engineId = args["engineId"] as! Int
-      let callId = args["callId"] as! Int
-      let url = args["url"] as! String
-      let method = args["method"] as! String
-      let headers = args["headers"] as! [[String]]
-      let hasBody = args["hasBody"] as! Bool
+      let engineId: Int = try arg(args, "engineId")
+      let callId: Int = try arg(args, "callId")
+      let url: String = try arg(args, "url")
+      let method: String = try arg(args, "method")
+      let headers: [[String]] = try arg(args, "headers")
+      guard headers.allSatisfy({ $0.count == 2 }) else { throw BadArgument(name: "headers") }
+      let hasBody: Bool = try arg(args, "hasBody")
       queue.async { self.open(engineId, callId, url, method, headers, hasBody) }
       reply(.success(nil))
     case "write":
-      let callId = args["callId"] as! Int
-      let data = args["data"] as! Data
+      let callId: Int = try arg(args, "callId")
+      let data: Data = try arg(args, "data")
       // Reply once the bytes are in the stream buffer, so a fast producer waits for URLSession to read them.
       queue.async {
         guard let c = self.calls[callId], let output = c.output else {
@@ -108,14 +134,14 @@ public final class URLSessionBridge {
         }
       }
     case "end":
-      let callId = args["callId"] as! Int
+      let callId: Int = try arg(args, "callId")
       queue.async {
         guard let c = self.calls[callId], let output = c.output else { return }
         c.writer.async { output.close() }
       }
       reply(.success(nil))
     case "cancel":
-      let callId = args["callId"] as! Int
+      let callId: Int = try arg(args, "callId")
       queue.async { self.calls[callId]?.task.cancel() }
       reply(.success(nil))
     default:

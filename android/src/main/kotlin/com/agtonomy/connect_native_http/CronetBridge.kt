@@ -3,6 +3,7 @@ package com.agtonomy.connect_native_http
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import org.chromium.net.BidirectionalStream
 import org.chromium.net.CronetEngine
 import org.chromium.net.CronetException
@@ -48,17 +49,47 @@ class CronetBridge(
         var responseComplete = false
         var endQueued = false
         val pending = ArrayDeque<Pair<ByteArray, Boolean>>()
+
+        // Set once Dart has been told how the call ended. After the bridge fails a call itself, Cronet's own final
+        // callback still follows, to release the stream.
+        var reported = false
     }
 
     fun cancelAll() {
-        executor.execute {
+        execute(null) {
             calls.values.forEach { it.stream.cancel() }
         }
     }
 
-    // Handles one method call. [reply] is called on the main thread.
+    // Runs [task] on the bridge's thread. An exception escaping it would end that thread, and with it the app: Android's
+    // default handler for uncaught exceptions kills the process. So it is logged, and fails the call it concerns.
+    private fun execute(callId: Int?, task: () -> Unit) {
+        executor.execute {
+            try {
+                task()
+            } catch (e: Exception) {
+                Log.e(TAG, "call $callId failed in the bridge", e)
+                if (callId != null) {
+                    abort(callId, e)
+                }
+            }
+        }
+    }
+
+    // Handles one method call. [reply] is called on the main thread, and arguments Dart got wrong are refused with an
+    // error reply rather than thrown on it.
     fun handle(method: String, args: Map<String, Any?>, reply: (Reply) -> Unit) {
         val result = { r: Reply -> main.post { reply(r) } }
+        try {
+            dispatch(method, args, result)
+        } catch (e: Exception) {
+            Log.e(TAG, "$method: bad arguments $args", e)
+            result(Reply.Error("badArguments", "$method: ${e.message}"))
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun dispatch(method: String, args: Map<String, Any?>, result: (Reply) -> Unit) {
         when (method) {
             "createEngine" -> {
                 val quicHints = (args["quicHints"] as List<List<Any>>?).orEmpty()
@@ -78,14 +109,16 @@ class CronetBridge(
                         val id = nextEngineId++
                         engines[id] = Engine(builder.build())
                         result(Reply.Success(id))
-                    } catch (e: Exception) {
-                        result(Reply.Error("createEngine", e.message))
+                    } catch (e: Throwable) {
+                        // Throwable, not Exception: failing to load Cronet's native library is an UnsatisfiedLinkError.
+                        Log.e(TAG, "createEngine failed", e)
+                        result(Reply.Error("createEngine", e.toString()))
                     }
                 }
             }
             "shutdownEngine" -> {
                 val engineId = args["engineId"] as Int
-                executor.execute {
+                execute(null) {
                     engines[engineId]?.let {
                         it.shuttingDown = true
                         shutdownIfIdle(engineId)
@@ -98,31 +131,31 @@ class CronetBridge(
                 val callId = args["callId"] as Int
                 val url = args["url"] as String
                 val httpMethod = args["method"] as String
-                val headers = args["headers"] as List<List<String>>
-                executor.execute { open(engineId, callId, url, httpMethod, headers) }
+                val headers = (args["headers"] as List<List<String>>).map { it[0] to it[1] }
+                execute(callId) { open(engineId, callId, url, httpMethod, headers) }
                 result(Reply.Success(null))
             }
             "write" -> {
                 val callId = args["callId"] as Int
                 val data = args["data"] as ByteArray
-                executor.execute { enqueue(callId, data, false) }
+                execute(callId) { enqueue(callId, data, false) }
                 result(Reply.Success(null))
             }
             "end" -> {
                 val callId = args["callId"] as Int
-                executor.execute { enqueue(callId, ByteArray(0), true) }
+                execute(callId) { enqueue(callId, ByteArray(0), true) }
                 result(Reply.Success(null))
             }
             "cancel" -> {
                 val callId = args["callId"] as Int
-                executor.execute { calls[callId]?.stream?.cancel() }
+                execute(callId) { calls[callId]?.stream?.cancel() }
                 result(Reply.Success(null))
             }
             else -> result(Reply.NotImplemented)
         }
     }
 
-    private fun open(engineId: Int, callId: Int, url: String, method: String, headers: List<List<String>>) {
+    private fun open(engineId: Int, callId: Int, url: String, method: String, headers: List<Pair<String, String>>) {
         val engine = engines[engineId]
         if (engine == null || engine.shuttingDown) {
             emit(failure(callId, false, "engine $engineId is shut down", null))
@@ -130,13 +163,30 @@ class CronetBridge(
         }
         val c = Call(callId, engineId)
         val builder = engine.cronet.newBidirectionalStreamBuilder(url, Callback(c), executor).setHttpMethod(method)
-        for (h in headers) {
-            builder.addHeader(h[0], h[1])
+        for ((name, value) in headers) {
+            builder.addHeader(name, value)
         }
         c.stream = builder.build()
+        // Throws on a method or header Cronet rejects, such as a value with a line break. The call is registered only
+        // once it has started, so abort() then reports it as never sent, with no stream to release.
+        c.stream.start()
         calls[callId] = c
         engine.callIds.add(callId)
-        c.stream.start()
+    }
+
+    // Fails a call the bridge itself could not carry on with, after an exception on its thread.
+    private fun abort(callId: Int, e: Exception) {
+        val message = "connect_native_http bridge: $e"
+        val c = calls[callId]
+        if (c == null) {
+            // Not started, so nothing was sent and there is no stream to release. A call that has already finished
+            // is gone too; Dart ignores events for calls it no longer has.
+            emit(failure(callId, false, message, null))
+            return
+        }
+        report(c, failure(callId, c.ready, message, null))
+        // Cronet's onCanceled then releases the call and the stream.
+        c.stream.cancel()
     }
 
     private fun enqueue(callId: Int, data: ByteArray, endOfStream: Boolean) {
@@ -145,8 +195,9 @@ class CronetBridge(
     }
 
     private fun enqueue(c: Call, data: ByteArray, endOfStream: Boolean) {
-        // Cronet rejects writes after the end of the request, which the bridge may already have sent itself.
-        if (c.endQueued) {
+        // Cronet rejects writes after the end of the request, which the bridge may already have sent itself, and an
+        // empty write before it, which has nothing to send anyway.
+        if (c.endQueued || c.reported || (data.isEmpty() && !endOfStream)) {
             return
         }
         c.endQueued = endOfStream
@@ -170,18 +221,31 @@ class CronetBridge(
         c.stream.flush()
     }
 
+    // Cronet's final callback for a call: releases it and, unless the bridge has already failed it, reports [event].
     private fun finish(c: Call, event: Map<String, Any?>) {
         calls.remove(c.callId)
         engines[c.engineId]?.callIds?.remove(c.callId)
-        emit(event)
+        report(c, event)
         shutdownIfIdle(c.engineId)
+    }
+
+    private fun report(c: Call, event: Map<String, Any?>) {
+        if (!c.reported) {
+            c.reported = true
+            emit(event)
+        }
     }
 
     private fun shutdownIfIdle(engineId: Int) {
         val engine = engines[engineId] ?: return
         if (engine.shuttingDown && engine.callIds.isEmpty()) {
             engines.remove(engineId)
-            engine.cronet.shutdown()
+            try {
+                engine.cronet.shutdown()
+            } catch (e: Exception) {
+                // Cronet refuses while it still counts a request as running. The engine is unreachable either way.
+                Log.w(TAG, "engine $engineId did not shut down", e)
+            }
         }
     }
 
@@ -195,6 +259,8 @@ class CronetBridge(
 
     private fun headerPairs(headers: List<Map.Entry<String, String>>) = headers.map { listOf(it.key, it.value) }
 
+    // Cronet catches exceptions from these methods itself: one from onStreamReady, onResponseHeadersReceived or
+    // onReadCompleted fails the stream (onFailed, with a CallbackException), and one from a final callback is logged.
     private inner class Callback(private val c: Call) : BidirectionalStream.Callback() {
         override fun onStreamReady(stream: BidirectionalStream) {
             c.ready = true
@@ -272,6 +338,7 @@ class CronetBridge(
     }
 
     private companion object {
+        const val TAG = "connect_native_http"
         const val READ_BUFFER_BYTES = 32 * 1024
     }
 }

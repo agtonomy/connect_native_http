@@ -37,6 +37,7 @@ public final class ConnectNativeHttpPlugin: NSObject, FlutterPlugin, FlutterStre
       DispatchQueue.main.async {
         switch reply {
         case .success(let value): result(value)
+        case .error(let code, let message): result(FlutterError(code: code, message: message, details: nil))
         case .notImplemented: result(FlutterMethodNotImplemented)
         }
       }

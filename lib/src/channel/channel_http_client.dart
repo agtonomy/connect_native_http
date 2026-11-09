@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:connectrpc/connect.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../native_http_client.dart';
@@ -85,11 +86,28 @@ final class _Call {
   }
 }
 
+/// Reports an error that has no caller to go to, such as one thrown by `onResponse`, through [FlutterError.reportError]:
+/// logged in debug builds, and passed to [FlutterError.onError] (an app's crash reporter, typically) in all builds.
+/// Nothing in this package lets such an error escape into a zone or a native thread, where it could crash the app.
+void reportError(Object error, StackTrace stack, String context) {
+  FlutterError.reportError(
+    FlutterErrorDetails(
+      exception: error,
+      stack: stack,
+      library: 'connect_native_http',
+      context: ErrorDescription(context),
+    ),
+  );
+}
+
 /// Routes one plugin's event stream to the call each event belongs to. Every client on that plugin shares it, so call
 /// ids are unique across clients.
 final class _Dispatcher {
   _Dispatcher(this.bridge) {
-    bridge.events.receiveBroadcastStream().listen(_onEvent);
+    bridge.events.receiveBroadcastStream().listen(
+      _onEvent,
+      onError: (Object error, StackTrace stack) => reportError(error, stack, 'while receiving ${bridge.name} events'),
+    );
   }
 
   static final _instances = <String, _Dispatcher>{};
@@ -108,28 +126,69 @@ final class _Dispatcher {
     return id;
   }
 
-  void _remove(int id) {
-    calls.remove(id);
+  _Call? remove(int id) {
     _onResponse.remove(id);
+    return calls.remove(id);
+  }
+
+  /// Asks the plugin to cancel call [id]; its `canceled` event then ends the call. Should the plugin fail to take the
+  /// request, no event will come, so the call ends here instead.
+  Future<void> cancel(int id) async {
+    try {
+      await bridge.methods.invokeMethod<void>('cancel', {'callId': id});
+    } catch (error, stack) {
+      final call = remove(id);
+      call?.fail(call.abortError ?? ConnectException(Code.canceled, '${bridge.name}: cancel failed: $error'));
+      reportError(error, stack, 'while canceling a ${bridge.name} call');
+    }
   }
 
   void _onEvent(Object? event) {
-    final e = (event! as Map).cast<String, Object?>();
-    final id = e['callId']! as int;
-    final call = calls[id];
+    final int id;
+    final _Call? call;
+    try {
+      id = (event! as Map)['callId']! as int;
+      call = calls[id];
+    } catch (error, stack) {
+      reportError(error, stack, 'while reading a ${bridge.name} event: $event');
+      return;
+    }
     if (call == null) {
       return;
     }
+    try {
+      _onCallEvent(id, call, (event as Map).cast<String, Object?>());
+    } catch (error, stack) {
+      // A malformed event: the call can't go on, but nothing else is affected.
+      remove(id);
+      call.fail(ConnectException(Code.internal, '${bridge.name}: bad event: $error', cause: error));
+      unawaited(cancel(id));
+      reportError(error, stack, 'while handling a ${bridge.name} event: $event');
+    }
+  }
+
+  void _onCallEvent(int id, _Call call, Map<String, Object?> e) {
     switch (e['type']) {
       case 'headers':
         final headers = bridge.responseHeaders([
           for (final pair in (e['headers']! as List).cast<List<Object?>>()) (pair[0]! as String, pair[1]! as String),
         ]);
+        final status = e['status']! as int;
         if (!bridge.endsStreamsItself && isConnectStreamingContentType(headers.get('content-type')?.firstOrNull)) {
           call.endStream = ConnectEndStreamDetector();
         }
-        _onResponse[id]?.call(NativeHttpResponseInfo(url: call.url, protocol: e['protocol'] as String?));
-        call.response.complete(HttpResponse(e['status']! as int, headers, call.body.stream, call.trailer));
+        final onResponse = _onResponse[id];
+        if (onResponse != null) {
+          // The caller's own callback: its failure is reported, and doesn't fail the call or leave it hanging.
+          try {
+            onResponse(NativeHttpResponseInfo(url: call.url, protocol: e['protocol'] as String?));
+          } catch (error, stack) {
+            reportError(error, stack, 'in NativeHttpConfig.onResponse');
+          }
+        }
+        if (!call.response.isCompleted) {
+          call.response.complete(HttpResponse(status, headers, call.body.stream, call.trailer));
+        }
       case 'data':
         _onData(id, call, e['data']! as Uint8List);
       case 'trailers':
@@ -139,14 +198,14 @@ final class _Dispatcher {
       case 'responseComplete':
         call.completeResponse(bridge.name);
       case 'done':
-        _remove(id);
+        remove(id);
         call.completeResponse(bridge.name);
       case 'failed':
-        _remove(id);
+        remove(id);
         final cause = bridge.failure(e);
         call.fail(call.abortError ?? ConnectException(Code.unavailable, cause.message, cause: cause));
       case 'canceled':
-        _remove(id);
+        remove(id);
         call.fail(call.abortError ?? ConnectException(Code.canceled, '${bridge.name}: stream canceled'));
     }
   }
@@ -166,7 +225,7 @@ final class _Dispatcher {
     }
     if (detector.done) {
       call.completeResponse(bridge.name);
-      unawaited(bridge.methods.invokeMethod<void>('cancel', {'callId': id}));
+      unawaited(cancel(id));
     }
   }
 }
@@ -195,31 +254,39 @@ base class ChannelHttpClient implements NativeHttpClient {
     final id = dispatcher.register(call, _config.onResponse);
     call.body.onCancel = () {
       if (!call.finished) {
-        unawaited(methods.invokeMethod<void>('cancel', {'callId': id}));
+        unawaited(dispatcher.cancel(id));
       }
     };
     req.signal?.future.then((error) {
       if (!call.finished) {
         call.abortError = error;
-        unawaited(methods.invokeMethod<void>('cancel', {'callId': id}));
+        unawaited(dispatcher.cancel(id));
       }
     });
-    await methods.invokeMethod<void>('open', {
-      'engineId': _engineId,
-      'callId': id,
-      'url': req.url,
-      'method': req.method,
-      'headers': [
-        for (final (:name, :value) in req.header.entries) [name, value],
-      ],
-      'hasBody': req.body != null,
-    });
-    unawaited(_sendBody(id, call, req.body));
+    try {
+      await methods.invokeMethod<void>('open', {
+        'engineId': _engineId,
+        'callId': id,
+        'url': req.url,
+        'method': req.method,
+        'headers': [
+          for (final (:name, :value) in req.header.entries) [name, value],
+        ],
+        'hasBody': req.body != null,
+      });
+    } catch (error) {
+      // The plugin refused the call, or isn't there (a background isolate, say): nothing was sent.
+      dispatcher.remove(id);
+      call.finished = true;
+      final cause = NativeHttpException(NativeHttpFailure.notSent, '${_bridge.name}: open failed: $error');
+      throw ConnectException(Code.unavailable, cause.message, cause: cause);
+    }
+    unawaited(_sendBody(id, call, req.body, dispatcher));
     return call.response.future;
   }
 
   /// Streams the request body to the plugin, one chunk per method call.
-  Future<void> _sendBody(int id, _Call call, Stream<Uint8List>? body) async {
+  Future<void> _sendBody(int id, _Call call, Stream<Uint8List>? body, _Dispatcher dispatcher) async {
     final methods = _bridge.methods;
     try {
       if (body != null) {
@@ -234,9 +301,12 @@ base class ChannelHttpClient implements NativeHttpClient {
         await methods.invokeMethod<void>('end', {'callId': id});
       }
     } catch (error) {
+      // The request stream failed, or the plugin refused a chunk: the call fails with that error.
       if (!call.finished) {
-        call.abortError ??= error;
-        await methods.invokeMethod<void>('cancel', {'callId': id});
+        call.abortError ??= error is PlatformException
+            ? ConnectException(Code.internal, '${_bridge.name}: request body refused: $error', cause: error)
+            : error;
+        await dispatcher.cancel(id);
       }
     }
   }

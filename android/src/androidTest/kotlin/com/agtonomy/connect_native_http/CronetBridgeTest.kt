@@ -68,24 +68,85 @@ class CronetBridgeTest {
         assertEquals(false, refused["streamReady"])
     }
 
-    private fun invoke(method: String, arguments: Map<String, Any?>): Any? {
+    // Cronet throws from start() on a header it rejects. On the bridge's thread that would have killed the app.
+    @Test
+    fun aHeaderCronetRejectsFailsTheCallAsNeverSent() {
+        val engine = createEngine()
+        open(engine, 1, SAY, "application/proto", extraHeaders = listOf(listOf("authorization", "Bearer x\r\ny")))
+        val outcome = awaitOutcome(1)
+        assertEquals("failed", outcome["type"])
+        assertEquals(false, outcome["streamReady"])
+        assertSayWorks(engine, 2)
+    }
+
+    // Cronet throws on an empty write before the end of the stream.
+    @Test
+    fun anEmptyWriteIsSkipped() {
+        val engine = createEngine()
+        open(engine, 1, SAY, "application/proto")
+        invoke("write", mapOf("callId" to 1, "data" to ByteArray(0)))
+        invoke("write", mapOf("callId" to 1, "data" to sentence("hi")))
+        invoke("end", mapOf("callId" to 1))
+        assertEquals("done", awaitOutcome(1)["type"])
+        assertTrue(received(1).contains("say: hi"))
+    }
+
+    @Test
+    fun malformedArgumentsAreRefusedInsteadOfCrashing() {
+        val engine = createEngine()
+        val malformed: List<Pair<String, Map<String, Any?>>> = listOf(
+            "open" to emptyMap<String, Any?>(),
+            "open" to mapOf("engineId" to "1", "callId" to 1),
+            "write" to mapOf("callId" to 1, "data" to "not bytes"),
+            "end" to mapOf("callId" to null),
+            "cancel" to emptyMap<String, Any?>(),
+            "shutdownEngine" to mapOf("engineId" to 1.5),
+        )
+        for ((method, arguments) in malformed) {
+            val reply = reply(method, arguments)
+            assertTrue("$method $arguments: $reply", reply is CronetBridge.Reply.Error)
+        }
+        val badHints = reply("createEngine", mapOf("quicHints" to listOf(listOf("localhost"))))
+        assertTrue("createEngine with a bad hint: $badHints", badHints is CronetBridge.Reply.Error)
+        assertSayWorks(engine, 1)
+    }
+
+    private fun assertSayWorks(engine: Int, callId: Int) {
+        open(engine, callId, SAY, "application/proto")
+        invoke("write", mapOf("callId" to callId, "data" to sentence("again")))
+        invoke("end", mapOf("callId" to callId))
+        assertEquals("done", awaitOutcome(callId)["type"])
+        assertTrue(received(callId).contains("say: again"))
+    }
+
+    private fun reply(method: String, arguments: Map<String, Any?>): CronetBridge.Reply {
         val result = CompletableFuture<CronetBridge.Reply>()
         bridge.handle(method, arguments) { result.complete(it) }
-        return when (val reply = result.get(3, TimeUnit.SECONDS)) {
+        return result.get(3, TimeUnit.SECONDS)
+    }
+
+    private fun invoke(method: String, arguments: Map<String, Any?>): Any? =
+        when (val reply = reply(method, arguments)) {
             is CronetBridge.Reply.Success -> reply.value
             else -> throw AssertionError("$method: $reply")
         }
-    }
 
     private fun createEngine(): Int = invoke("createEngine", mapOf("quicHints" to emptyList<Any>())) as Int
 
-    private fun open(engine: Int, callId: Int, path: String, contentType: String) {
+    private fun open(
+        engine: Int,
+        callId: Int,
+        path: String,
+        contentType: String,
+        extraHeaders: List<List<String>> = emptyList(),
+    ) {
         invoke("open", mapOf(
             "engineId" to engine,
             "callId" to callId,
             "url" to serverUrl + path,
             "method" to "POST",
-            "headers" to listOf(listOf("content-type", contentType), listOf("connect-protocol-version", "1")),
+            "headers" to listOf(listOf("content-type", contentType), listOf("connect-protocol-version", "1")) +
+                extraHeaders,
         ))
     }
 

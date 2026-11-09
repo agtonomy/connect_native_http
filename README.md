@@ -39,6 +39,19 @@ whether the request provably never left the device (`requestNeverSent`), which m
 | `untrusted` | -1201 to -1204, certificate rejected | `net::` certificate errors -200 to -299, or a pin mismatch (-150) |
 | `other` | Everything else, timeouts and dropped connections included | Any failure after `onStreamReady` |
 
+Nothing the package does should crash the app or leave a call hanging. Failures end the one call they concern:
+
+- **A request the platform stack rejects** fails that call as `notSent`. For example, Cronet throws on a header value
+  with a line break.
+- **A method call the plugin can't parse** gets an error reply instead of a force-unwrap (iOS) or an uncaught
+  exception (Android). Uncaught exceptions on the Android bridge's thread would otherwise kill the process.
+- **A malformed event** fails its own call with `internal`.
+- **An exception from `onResponse`** goes to `FlutterError.onError`, like other errors that have no caller. The call
+  carries on.
+
+`NativeHttpClient.create` throws a `PlatformException` if the platform can't create a client, for example when Cronet's
+native library fails to load.
+
 ## Server and infrastructure requirements
 
 The clients only reach HTTP/3, and only keep bidi working, if the server side meets these requirements. Each was
@@ -227,7 +240,8 @@ Neither platform finishes a stream on its own while the client still has its req
 
   - **Android (`android/src/androidTest`, instrumented):** writes sent before Cronet is ready go out once it is; a
     write after the server finished the call is dropped instead of crashing; shutting an engine down lets its calls
-    finish and refuses new ones.
+    finish and refuses new ones; a header Cronet rejects fails its call as never sent; an empty write is skipped.
+  - Both platforms' suites also check that malformed method calls get an error reply and leave the bridge working.
 - **`example/integration_test/public_server_test.dart`:** HTTP/3 on Android against a server with a public
   certificate. It also checks that `quicIdleTimeout` ends a quiet connection, against a control without it. It is
   opt-in because it needs the internet:
