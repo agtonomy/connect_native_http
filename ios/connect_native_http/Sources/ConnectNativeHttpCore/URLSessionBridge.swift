@@ -69,8 +69,12 @@ public final class URLSessionBridge {
         // URLSession fails a task that receives nothing for this long. Its default of 60 s would end a quiet stream
         // or a long-running unary call; callers bound calls with deadlines instead.
         configuration.timeoutIntervalForRequest = 24 * 60 * 60
-        let session = URLSession(
-          configuration: configuration, delegate: Delegate(bridge: self), delegateQueue: self.delegateQueue)
+        // Only a bridge with its own roots implements the trust challenge. With the system's roots the network stack
+        // checks certificates itself; a delegate that implements the challenge makes every TLS handshake, QUIC and
+        // TCP alike, wait for an answer from `queue` first. At app launch on CI that answer once took 126 ms while
+        // the QUIC handshake waited, and URLSession's TCP attempt won the race.
+        let delegate = self.trustedRoots.isEmpty ? Delegate(bridge: self) : TrustingDelegate(bridge: self)
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: self.delegateQueue)
         let id = self.nextSessionId
         self.nextSessionId += 1
         self.sessions[id] = Session(urlSession: session, http3Origins: Set(origins))
@@ -226,8 +230,7 @@ public final class URLSessionBridge {
   fileprivate func serverTrust(_ challenge: URLAuthenticationChallenge) -> (
     URLSession.AuthChallengeDisposition, URLCredential?
   ) {
-    guard !trustedRoots.isEmpty,
-      challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+    guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
       let trust = challenge.protectionSpace.serverTrust
     else {
       return (.performDefaultHandling, nil)
@@ -243,19 +246,11 @@ public final class URLSessionBridge {
 }
 
 // URLSession keeps its delegate until the session is invalidated, so this holds the bridge weakly.
-private final class Delegate: NSObject, URLSessionDataDelegate {
+private class Delegate: NSObject, URLSessionDataDelegate {
   weak var bridge: URLSessionBridge?
 
   init(bridge: URLSessionBridge) {
     self.bridge = bridge
-  }
-
-  func urlSession(
-    _ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
-    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
-  ) {
-    let (disposition, credential) = bridge?.serverTrust(challenge) ?? (.performDefaultHandling, nil)
-    completionHandler(disposition, credential)
   }
 
   func urlSession(
@@ -285,5 +280,18 @@ private final class Delegate: NSObject, URLSessionDataDelegate {
 
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     bridge?.didComplete(task, error: error)
+  }
+}
+
+// A Delegate that also checks server certificates against the bridge's own roots. URLSession looks the method up by
+// its Objective-C selector, hence the explicit name: a subclass doesn't inherit the protocol's @objc inference.
+private final class TrustingDelegate: Delegate {
+  @objc(URLSession:didReceiveChallenge:completionHandler:)
+  func urlSession(
+    _ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+  ) {
+    let (disposition, credential) = bridge?.serverTrust(challenge) ?? (.performDefaultHandling, nil)
+    completionHandler(disposition, credential)
   }
 }
