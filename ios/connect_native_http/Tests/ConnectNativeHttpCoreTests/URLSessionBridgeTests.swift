@@ -4,7 +4,8 @@ import XCTest
 @testable import ConnectNativeHttpCore
 
 // Bridge behavior the Dart integration tests can't reach, against test_server/. run_integration_tests.sh starts the
-// server and passes its URL as SERVER_URL and its CA certificate (DER) as SERVER_CA.
+// server, passes its URL as SERVER_URL and installs its CA in the simulator's trust store; the bridge only uses that
+// store.
 final class URLSessionBridgeTests: XCTestCase {
   private static let converse = "/connectrpc.eliza.v1.ElizaService/Converse"
   private static let say = "/connectrpc.eliza.v1.ElizaService/Say"
@@ -17,12 +18,11 @@ final class URLSessionBridgeTests: XCTestCase {
 
   override func setUpWithError() throws {
     let env = ProcessInfo.processInfo.environment
-    guard let url = env["SERVER_URL"], let caPath = env["SERVER_CA"] else {
-      throw XCTSkip("SERVER_URL and SERVER_CA are not set; run these through run_integration_tests.sh")
+    guard let url = env["SERVER_URL"] else {
+      throw XCTSkip("SERVER_URL is not set; run these through run_integration_tests.sh")
     }
     serverURL = url
-    let ca = try XCTUnwrap(SecCertificateCreateWithData(nil, try Data(contentsOf: URL(fileURLWithPath: caPath)) as CFData))
-    bridge = URLSessionBridge(trustedRoots: [ca]) { [weak self] event in
+    bridge = URLSessionBridge { [weak self] event in
       guard let self else { return }
       lock.withLock { self.events.append(event) }
     }

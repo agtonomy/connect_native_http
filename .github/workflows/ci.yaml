@@ -95,13 +95,18 @@ jobs:
           echo "test server did not come up" >&2
           cat server.log >&2
           exit 1
+      # The bridge checks certificates against the system trust store only, with no delegate callback, so the
+      # server's CA (written on its first start, above) has to be in it. The runner is thrown away after the job.
+      - name: Trust the test server's CA
+        timeout-minutes: 2
+        run: |
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain test_server/certs/ca.pem
       - name: Swift tests
         timeout-minutes: 5
         working-directory: ios/connect_native_http
         env:
           CONNECT_NATIVE_HTTP_CORE_ONLY: "1"
           SERVER_URL: https://localhost:8443
-          SERVER_CA: ${{ github.workspace }}/test_server/certs/ca.der
         run: swift test
       - name: Upload test server log
         if: failure()

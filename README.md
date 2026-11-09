@@ -218,11 +218,14 @@ Neither platform finishes a stream on its own while the client still has its req
   - **iOS (`ios/connect_native_http/Tests`, XCTest):** a write stuck on a full buffer returns once the call is
     canceled or its connection fails; a redirect of a request with a body is returned, not followed; shutting a
     session down lets its calls finish and refuses new ones. The script runs them on the simulator. For a quick loop
-    on the Mac, against a running test server:
+    on the Mac, against a running test server, the bridge needs the server's CA in the Mac's trust store: it checks
+    certificates against that store only, with no callback of its own. Anyone with the CA's key, in
+    `test_server/certs`, can then impersonate any site to your Mac, so remove it afterwards, or prefer the simulator:
+    `sudo security delete-certificate -c "connect_native_http test CA" /Library/Keychains/System.keychain`.
 
     ```bash
-    cd ios/connect_native_http && CONNECT_NATIVE_HTTP_CORE_ONLY=1 SERVER_URL=https://localhost:8443 \
-      SERVER_CA=../../test_server/certs/ca.der swift test
+    sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain test_server/certs/ca.pem
+    cd ios/connect_native_http && CONNECT_NATIVE_HTTP_CORE_ONLY=1 SERVER_URL=https://localhost:8443 swift test
     ```
 
   - **Android (`android/src/androidTest`, instrumented):** writes sent before Cronet is ready go out once it is; a
