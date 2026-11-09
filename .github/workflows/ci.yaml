@@ -145,6 +145,21 @@ jobs:
           - name: Build native bridge tests
             timeout-minutes: 6
             run: ios/connect_native_http/build_core_tests.sh build/ios_core_tests
+          # simslim (github.com/MobAI-App/simslim) boots the simulator below with the background daemons the tests don't
+          # use switched off. The release's prebuilt arm64 binary, checked against its hash.
+          - name: Install simslim
+            timeout-minutes: 2
+            env:
+              SIMSLIM_VERSION: v0.14.0
+              SIMSLIM_SHA256: a3db0de6f428f9f8fd5dff256b122f98791c138521dc1330d99643719d8fe9ff
+            run: |
+              archive="$RUNNER_TEMP/simslim.tar.gz"
+              curl -fsSL --retry 3 -o "$archive" \
+                "https://github.com/MobAI-App/simslim/releases/download/$SIMSLIM_VERSION/simslim-$SIMSLIM_VERSION-macos-arm64.tar.gz"
+              echo "$SIMSLIM_SHA256  $archive" | shasum -a 256 -c
+              mkdir -p "$RUNNER_TEMP/simslim"
+              tar -xzf "$archive" -C "$RUNNER_TEMP/simslim"
+              "$RUNNER_TEMP/simslim/simslim" --version
       # flutter test sometimes misses the app's VM service in the simulator's log and waits forever (flutter/flutter
       # #181771; see the patch). Fails when the patch no longer applies, which means .fvmrc moved: drop it then if the
       # new release has the fix. Removing the stamp makes the next flutter command rebuild the tool, done here.
@@ -166,9 +181,14 @@ jobs:
           flutter --version
       # Not in the group above: the simulator's first-boot data migration saturates the runner's disk, and in parallel
       # it stalled the Flutter download to under 1 MB/s and timed out setup-go.
+      # simslim writes launchd disable overrides for about 170 daemons (Siri, Spotlight, widgets, Photos, iCloud, News,
+      # telemetry...) into the shut-down simulator, which then boots once, already slim. None of them back what the
+      # tests use: networking, trustd and the keychain aren't among them. Should a runtime ignore the overrides, simslim
+      # instead boots, disables each daemon through launchctl and reboots, which takes minutes; --boot-timeout bounds
+      # that within the step's own timeout.
       - name: Boot simulator
         id: simulator
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: |
           udid=$(xcrun simctl list devices available --json |
             jq -r '[.devices | to_entries[] | select(.key | contains("iOS")) | .value[] |
@@ -179,9 +199,12 @@ jobs:
             exit 1
           fi
           echo "udid=$udid" >> "$GITHUB_OUTPUT"
-          xcrun simctl bootstatus "$udid" -b
+          # Boots it too, and waits for the boot to finish (simctl bootstatus -b).
+          "$RUNNER_TEMP/simslim/simslim" on "$udid" --boot-timeout 7m
           # Every step targets $udid; anything else booted could answer in its place.
           xcrun simctl list devices booted
+          # Memory and process count, to compare with a stock simulator.
+          "$RUNNER_TEMP/simslim/simslim" measure "$udid" || true
       # The network stack's view of every connection the tests make (QUIC vs TCP races, handshakes), uploaded below.
       # Cheap, and the only way to see why a connection stalled or fell back to HTTP/2. trustd too: certificate
       # evaluation happens there, and in run 42427208429 one took 151 ms (2-10 ms usually) and let TCP win the race.
