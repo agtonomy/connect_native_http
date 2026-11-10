@@ -92,6 +92,20 @@ class CronetBridgeTest {
     }
 
     @Test
+    fun aGetEndsWithoutAWriteToItsRequestSide() {
+        val engine = createEngine()
+        // Cronet ends a GET's request side with its headers. Ending it again, as Dart does for every call and the
+        // bridge does once the response is complete, would abort the process.
+        invoke("open", openArguments(engine, 1, SAY, "application/proto", method = "GET"))
+        invoke("write", mapOf("callId" to 1, "data" to sentence("ignored")))
+        invoke("end", mapOf("callId" to 1))
+        // Whatever the server makes of a GET without a message, it answers, and the call ends with that answer.
+        assertEquals("done", awaitOutcome(1)["type"])
+        await(1, "headers")
+        assertSayWorks(engine, 2)
+    }
+
+    @Test
     fun aReadIdleTimeoutFailsAQuietCallAndTheEngineCarriesOn() {
         val engine = createEngine()
         // The timer also runs while the connection is set up, which through the emulator once took longer than the
@@ -204,11 +218,12 @@ class CronetBridgeTest {
         path: String,
         contentType: String,
         extraHeaders: List<List<String>> = emptyList(),
+        method: String = "POST",
     ): Map<String, Any?> = mapOf(
         "engineId" to engine,
         "callId" to callId,
         "url" to serverUrl + path,
-        "method" to "POST",
+        "method" to method,
         "headers" to listOf(listOf("content-type", contentType), listOf("connect-protocol-version", "1")) +
             extraHeaders,
     )

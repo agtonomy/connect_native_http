@@ -154,6 +154,7 @@ func protocolHeaders(next http.Handler, altSvc string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s %s from %s", r.Proto, r.Method, r.URL.Path, r.RemoteAddr)
 		w.Header().Set("X-Proto", r.Proto)
+		w.Header().Set("X-Method", r.Method)
 		w.Header().Set("X-Remote-Addr", r.RemoteAddr)
 		if r.ProtoMajor < 3 && altSvc != "" {
 			w.Header().Set("Alt-Svc", altSvc)

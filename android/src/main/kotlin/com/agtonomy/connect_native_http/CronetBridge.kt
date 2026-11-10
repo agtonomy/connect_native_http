@@ -64,6 +64,10 @@ class CronetBridge(
         val pool: Pool,
         val origin: String,
         val readIdleTimeoutNanos: Long?,
+        // Whether the request has a body side to write to and end. Cronet ends a GET's or HEAD's with the headers, and
+        // a write after that, even the empty one that ends a request, aborts the process (a CHECK in Chromium's
+        // SpdyStream::SendData).
+        val writable: Boolean,
     ) {
         lateinit var stream: BidirectionalStream
 
@@ -83,8 +87,9 @@ class CronetBridge(
         var reported = false
     }
 
-    // Ends the bridge when its Flutter engine goes away: cancels the calls in flight and shuts every engine down. Cronet's
-    // final callbacks for those calls still run on the bridge's thread, so it stops once the last engine has shut down.
+    // Ends the bridge when its Flutter engine goes away: cancels the calls in flight and shuts every engine down.
+    // Cronet's final callbacks for those calls still run on the bridge's thread, so it stops once the last engine has
+    // shut down.
     fun close() {
         try {
             execute(null) {
@@ -234,7 +239,15 @@ class CronetBridge(
             return
         }
         val pool = engine.current
-        val c = Call(callId, engineId, pool, origin(url), readIdleTimeoutMs?.let { TimeUnit.MILLISECONDS.toNanos(it) })
+        val c = Call(
+            callId,
+            engineId,
+            pool,
+            origin(url),
+            readIdleTimeoutMs?.let { TimeUnit.MILLISECONDS.toNanos(it) },
+            // The methods Cronet itself takes to have no body (CronetBidirectionalStream.doesMethodAllowWriteData).
+            writable = method != "GET" && method != "HEAD",
+        )
         val builder = pool.cronet.newBidirectionalStreamBuilder(url, Callback(c), executor).setHttpMethod(method)
         for ((name, value) in headers) {
             builder.addHeader(name, value)
@@ -350,8 +363,8 @@ class CronetBridge(
 
     private fun enqueue(c: Call, data: ByteArray, endOfStream: Boolean) {
         // Cronet rejects writes after the end of the request, which the bridge may already have sent itself, and an
-        // empty write before it, which has nothing to send anyway.
-        if (c.endQueued || c.reported || (data.isEmpty() && !endOfStream)) {
+        // empty write before it, which has nothing to send anyway. A GET or HEAD has no request side to write to.
+        if (!c.writable || c.endQueued || c.reported || (data.isEmpty() && !endOfStream)) {
             return
         }
         c.endQueued = endOfStream
