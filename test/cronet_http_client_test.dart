@@ -285,6 +285,41 @@ void main() {
       expect((await cancelAfterDeadline(evicting))['evictConnection'], isTrue);
     });
 
+    test('a call still receiving within the server\'s head start does not evict', () async {
+      final both = await CronetHttpClient.create(
+        const NativeHttpConfig(deadlineStep: Duration(seconds: 1), evictOnDeadline: true),
+      );
+      Future<Map<Object?, Object?>> cancelArgs({required bool receiveLate}) async {
+        plugin.calls.clear();
+        // 400 ms: the server gets 200 ms, half, so its head start is 200 ms.
+        final headers = Headers()
+          ..add('content-type', 'application/proto')
+          ..add('connect-timeout-ms', '400');
+        final req = HttpRequest(
+          'https://example.test/svc/Method',
+          'POST',
+          headers,
+          StreamController<Uint8List>().stream,
+          TimeoutSignal(const Duration(milliseconds: 400)),
+        );
+        final response = both.httpClient(req);
+        await settle();
+        final id = plugin.lastCallId;
+        if (receiveLate) {
+          await Future<void>.delayed(const Duration(milliseconds: 330));
+          await plugin.headers(id);
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        final cancel = plugin.callsTo('cancel').single.arguments as Map;
+        await plugin.emit({'callId': id, 'type': 'canceled'});
+        await response.then((r) => r.body.drain<void>()).catchError((_) {});
+        return cancel;
+      }
+
+      expect((await cancelArgs(receiveLate: false))['evictConnection'], isTrue);
+      expect((await cancelArgs(receiveLate: true)).containsKey('evictConnection'), isFalse);
+    });
+
     test('a signal that is not a deadline leaves the connection alone', () async {
       final evicting = await CronetHttpClient.create(const NativeHttpConfig(evictOnDeadline: true));
       final signal = CancelableSignal();

@@ -11,6 +11,7 @@ import org.chromium.net.NetworkException
 import org.chromium.net.QuicOptions
 import org.chromium.net.UrlResponseInfo
 import java.net.URI
+import java.net.URISyntaxException
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -40,8 +41,9 @@ class CronetBridge(
 
     private class EngineOptions(val quicHints: List<Pair<String, Int>>, val quicIdleTimeoutSeconds: Int?)
 
-    // One CronetEngine and the calls on it. An engine whose call hit its read-idle timeout is retired: new calls go to
-    // a fresh one, with its own connections, and the retired one shuts down once its last call ends.
+    // One CronetEngine and the calls on it. An engine whose call ran out of time on a quiet connection (see evict) is
+    // retired: new calls go to a fresh one, with its own connections, and the retired one shuts down once its last call
+    // ends.
     private class Pool(val cronet: CronetEngine) {
         val callIds = HashSet<Int>()
 
@@ -211,15 +213,7 @@ class CronetBridge(
             return
         }
         val pool = engine.current
-        val target = URI(url)
-        val port = if (target.port != -1) target.port else if (target.scheme == "http") 80 else 443
-        val c = Call(
-            callId,
-            engineId,
-            pool,
-            "${target.host}:$port",
-            readIdleTimeoutMs?.let { TimeUnit.MILLISECONDS.toNanos(it) },
-        )
+        val c = Call(callId, engineId, pool, origin(url), readIdleTimeoutMs?.let { TimeUnit.MILLISECONDS.toNanos(it) })
         val builder = pool.cronet.newBidirectionalStreamBuilder(url, Callback(c), executor).setHttpMethod(method)
         for ((name, value) in headers) {
             builder.addHeader(name, value)
@@ -232,6 +226,18 @@ class CronetBridge(
         pool.callIds.add(callId)
         c.lastReceived = System.nanoTime()
         scheduleReadIdleCheck(c, c.readIdleTimeoutNanos)
+    }
+
+    // "host:port" of [url], for telling which calls share connections. java.net.URI is stricter than Cronet, so a URL it
+    // rejects stands for itself rather than failing a call Cronet would carry.
+    private fun origin(url: String): String {
+        val target = try {
+            URI(url)
+        } catch (e: URISyntaxException) {
+            return url
+        }
+        val port = if (target.port != -1) target.port else if (target.scheme == "http") 80 else 443
+        return "${target.host}:$port"
     }
 
     // Read-idle timeout. Rather than rescheduling on every chunk received, each check finds when the call last received
@@ -293,7 +299,7 @@ class CronetBridge(
             Pool(build(engine.options))
         } catch (e: Throwable) {
             // Keep the engine there is; new calls on a dead connection fail on their own timeouts.
-            Log.e(TAG, "engine ${c.engineId}: could not replace the CronetEngine after a read idle timeout", e)
+            Log.e(TAG, "engine ${c.engineId}: could not replace the CronetEngine for call ${c.callId}", e)
             return
         }
         engine.retired.add(engine.current)

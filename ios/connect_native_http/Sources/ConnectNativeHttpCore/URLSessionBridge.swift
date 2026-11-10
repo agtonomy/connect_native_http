@@ -180,7 +180,7 @@ public final class URLSessionBridge {
   private func makeURLSession() -> URLSession {
     let configuration = URLSessionConfiguration.ephemeral
     // URLSession fails a task that receives nothing for this long. Its default of 60 s would end a quiet stream or a
-    // long-running unary call; callers bound calls with deadlines, or set their own read-idle timeout per request.
+    // long-running unary call; callers bound calls with deadlines, or set the client's read-idle timeout.
     configuration.timeoutIntervalForRequest = Self.sessionIdleTimeout
     // Only a bridge with its own roots implements the trust challenge. With the system's roots there is nothing for
     // the delegate to decide, so certificate checks are left entirely to the network stack.
@@ -213,7 +213,8 @@ public final class URLSessionBridge {
       request.addValue(h[1], forHTTPHeaderField: h[0])
     }
     let port = target.port ?? (target.scheme == "http" ? 80 : 443)
-    request.assumesHTTP3Capable = session.http3Origins.contains("\(target.host ?? ""):\(port)")
+    let origin = "\(target.host ?? ""):\(port)"
+    request.assumesHTTP3Capable = session.http3Origins.contains(origin)
     // The request's read-idle timeout: URLSession fails the task once it has received nothing for this long, with
     // NSURLErrorTimedOut.
     if let interval = Self.requestTimeoutInterval(readIdleTimeoutMs: readIdleTimeoutMs) {
@@ -223,7 +224,7 @@ public final class URLSessionBridge {
     let c = Call(callId: callId)
     c.engineId = engineId
     c.urlSession = session.urlSession
-    c.origin = "\(target.host ?? ""):\(port)"
+    c.origin = origin
     if hasBody {
       var input: InputStream?
       var output: OutputStream?

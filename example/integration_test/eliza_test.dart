@@ -463,6 +463,34 @@ void main() {
     expect(h2.remoteAddrs.last, liveAddr);
   }, timeout: http2CaseTimeout);
 
+  testCase('a read-idle timeout keeps a connection another call is still receiving on', (_) async {
+    // The quiet stream's timeout says nothing about the connection while the busy one keeps hearing from the server.
+    if (skipUnlessAdmin()) {
+      return;
+    }
+    const timeout = Duration(seconds: 1);
+    final h2 = await harnessOverHttp2(readIdleTimeout: timeout);
+    final (quietRequests, quiet) = await openQuietConverse(h2);
+    final liveAddr = h2.remoteAddrs.last;
+    final (busyRequests, busy) = await openQuietConverse(h2);
+    expect(h2.remoteAddrs.last, liveAddr);
+
+    final quietFailure = nativeCause(quiet.moveNext());
+    for (var i = 0; i < 6; i++) {
+      await Future<void>.delayed(timeout * 0.3);
+      busyRequests.add(ConverseRequest(sentence: 'ping $i'));
+      expect(await busy.moveNext(), isTrue);
+    }
+    expect((await quietFailure).platformCode, readIdleTimeoutCode);
+
+    await h2.eliza.say(SayRequest(sentence: 'after'), onHeader: h2.recordHeaders);
+    expect(h2.remoteAddrs.last, liveAddr);
+    busyRequests.add(ConverseRequest(sentence: 'bye'));
+    expect(await busy.moveNext(), isTrue);
+    await busyRequests.close();
+    await quietRequests.close();
+  }, timeout: http2CaseTimeout);
+
   testCase('a read-idle timeout notices a dead HTTP/2 connection, and the next call dials a new one', (_) async {
     if (skipUnlessAdmin()) {
       return;
