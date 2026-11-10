@@ -116,16 +116,20 @@ final class URLSessionBridgeTests: XCTestCase {
     XCTAssertTrue(received(2).contains("say: after"))
   }
 
-  // After a deadline the task stays open for the grace period, for a sign that its connection is alive.
-  func testADeadlineCancelWaitsOutTheGracePeriod() async throws {
+  // A call that hit its deadline is canceled at once, and moves the engine's new calls to a fresh URLSession.
+  func testADeadlineCancelEndsTheCallAndTheEngineCarriesOn() async throws {
     let engine = try await createEngine()
     try await open(engine, callId: 1, path: Self.converse, contentType: "application/connect+proto")
     try await waitUntil("the greeting arrived", timeout: 10) { self.received(1).contains("hello") }
-    let start = Date()
-    try await invoke("cancel", ["callId": 1, "deadlineGraceMs": 500])
+    try await invoke("cancel", ["callId": 1, "evictConnection": true])
     try await waitUntil("the call was canceled") { self.outcome(1) != nil }
     XCTAssertEqual(outcome(1)?["type"] as? String, "canceled", "\(String(describing: outcome(1)))")
-    XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(start), 0.45, "canceled before the 500 ms grace period")
+
+    try await open(engine, callId: 2, path: Self.say, contentType: "application/proto")
+    try await write(2, sentence("after"))
+    try await invoke("end", ["callId": 2])
+    try await waitUntil("the next call ended", timeout: 10) { self.outcome(2) != nil }
+    XCTAssertEqual(outcome(2)?["type"] as? String, "done", "\(String(describing: outcome(2)))")
   }
 
   func testRequestTimeoutIntervalAvoidsTheValueURLSessionIgnores() {
@@ -150,8 +154,7 @@ final class URLSessionBridgeTests: XCTestCase {
       ("write", ["callId": 1, "data": "not bytes"]),
       ("end", ["callId": "1"]),
       ("cancel", [:]),
-      ("cancel", ["callId": 1, "deadlineGraceMs": 0]),
-      ("cancel", ["callId": 1, "deadlineGraceMs": "soon"]),
+      ("cancel", ["callId": 1, "evictConnection": "yes"]),
       ("shutdownEngine", ["engineId": NSNull()]),
       ("createEngine", ["http3Origins": [["localhost"]]]),
     ]

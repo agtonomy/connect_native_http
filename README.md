@@ -84,11 +84,12 @@ off such a connection, so they don't wait on it too.
 - **Read-idle timeout:** the connection counts as dead if nothing has arrived from the call's origin (host and port),
   on any call, since the call last received anything. If something has, the connection is alive and only that call
   was slow, so nothing changes.
-- **Deadline:** the call fails at its deadline, as always. connect-dart sends the deadline in `connect-timeout-ms`, so
-  the server times the call out too and answers `deadline_exceeded`. Its clock starts later, so its answer arrives
-  about a round trip after the client's deadline. The bridge therefore keeps the stream open for 1 s more before
-  canceling it. If anything arrives from the origin in that time, the server's answer included, the connection is
-  alive. If nothing does, it counts as dead.
+- **Deadline:** each hop takes a step off the deadline it passes on. connect-dart sends the call's deadline in
+  `connect-timeout-ms`, and the client sends the server 1 s less, or half the deadline when that is less, so the
+  server never gets zero. A server that is reachable then times the call out first and answers `deadline_exceeded`
+  before the client's own deadline fires. So when the client's deadline fires, the server's answer never came, and the
+  connection counts as dead under the same check as a read-idle timeout. Servers that call further services should
+  take their own step off the deadline they pass on.
 - **A dead connection is evicted.** Neither stack can close a single connection, so the client moves its new calls to
   a fresh `URLSession` or `CronetEngine`, which dials its own connections. Calls already on the old one are not
   canceled. They finish there, and it is released after the last one ends. Several calls that run out of time on the
@@ -188,7 +189,8 @@ or a read-idle timeout (see "Calls that run out of time"). The integration tests
   deadline. The call after that goes out on a new connection.
 - With a read-idle timeout, the call fails within the timeout, and the client's next call goes out on a new
   connection.
-- A call the server answers with `deadline_exceeded` leaves the client on the same connection.
+- The server answers a deadline with `deadline_exceeded` a step before the client's own deadline, and the client
+  stays on the same connection.
 
 ### QUIC idle timeout vs HTTP/2 keepalive pings
 
@@ -289,15 +291,16 @@ Neither platform finishes a stream on its own while the client still has its req
   - A frozen connection draws no error, and new calls go to it until one hits its deadline. The call after that is
     on a new connection.
   - With a read-idle timeout, the call fails and the client's next call is on a new connection.
-  - A deadline the server answers leaves the client on the same connection.
+  - The server answers a deadline a step before the client's, and the client stays on the same connection.
 - **Native bridge tests:** the same script runs them after the Dart tests, against the same server. Each platform's
   bridge (`URLSessionBridge`, `CronetBridge`) has no Flutter dependency, and the tests call it directly, for behavior
   Dart can't reach:
   - **iOS (`ios/connect_native_http/Tests`, XCTest):** a write stuck on a full buffer returns once the call is
     canceled or its connection fails; a redirect of a request with a body is returned, not followed; shutting a
     session down lets its calls finish and refuses new ones; a read-idle timeout fails a quiet call with
-    `NSURLErrorTimedOut`, and the engine's next call works; a deadline cancel waits out its grace period. The script runs them on the simulator. For a quick loop
-    on the Mac, against a running test server:
+    `NSURLErrorTimedOut`, and the engine's next call works; a call canceled at its deadline ends at once, and the
+    engine's next call works. The script runs them on the simulator. For a quick loop on the Mac, against a running
+    test server:
 
     ```bash
     cd ios/connect_native_http && CONNECT_NATIVE_HTTP_CORE_ONLY=1 SERVER_URL=https://localhost:8443 \
@@ -308,7 +311,7 @@ Neither platform finishes a stream on its own while the client still has its req
     write after the server finished the call is dropped instead of crashing; shutting an engine down lets its calls
     finish and refuses new ones; a header Cronet rejects fails its call as never sent; an empty write is skipped; a
     read-idle timeout fails a quiet call with -7, once, and the engine's next call works; data arriving resets the
-    timer; a deadline cancel waits out its grace period.
+    timer; a call canceled at its deadline ends at once, and the engine's next call works.
   - Both platforms' suites also check that malformed method calls get an error reply and leave the bridge working.
 - **`example/integration_test/public_server_test.dart`:** HTTP/3 on Android against a server with a public
   certificate. It also checks that `quicIdleTimeout` ends a quiet connection, against a control without it. It is

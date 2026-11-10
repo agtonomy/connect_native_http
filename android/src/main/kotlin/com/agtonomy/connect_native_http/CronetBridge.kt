@@ -168,16 +168,15 @@ class CronetBridge(
             }
             "cancel" -> {
                 val callId = args["callId"] as Int
-                // Set when the call hit its deadline: see cancelAfterDeadline.
-                val deadlineGraceMs = (args["deadlineGraceMs"] as Number?)?.toLong()
-                require(deadlineGraceMs == null || deadlineGraceMs > 0) { "deadlineGraceMs: $deadlineGraceMs" }
+                // Set when the call hit its deadline. The server was given a deadline a step earlier, so on a live
+                // connection its deadline_exceeded would have ended the call first.
+                val evictConnection = args["evictConnection"] as Boolean? ?: false
                 execute(callId) {
                     val c = calls[callId] ?: return@execute
-                    if (deadlineGraceMs != null) {
-                        cancelAfterDeadline(c, deadlineGraceMs)
-                    } else {
-                        c.stream.cancel()
+                    if (evictConnection) {
+                        evict(c)
                     }
+                    c.stream.cancel()
                 }
                 result(Reply.Success(null))
             }
@@ -276,27 +275,7 @@ class CronetBridge(
         c.pool.lastReceived[c.origin] = now
     }
 
-    // The call has hit its deadline and Dart has already failed it. The server enforces the same deadline and answers
-    // about a round trip later, so the stream stays open for the grace period: an answer, or anything else from the
-    // origin, shows the connection is alive. After it, the stream is canceled, and the connection evicted if it stayed
-    // quiet.
-    private fun cancelAfterDeadline(c: Call, graceMs: Long) {
-        val check = Runnable {
-            try {
-                // Gone: the server's answer ended it, or Cronet failed it.
-                if (calls[c.callId] === c) {
-                    evict(c)
-                    c.stream.cancel()
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "call ${c.callId} failed in the bridge", e)
-                abort(c.callId, e)
-            }
-        }
-        executor.schedule(check, graceMs, TimeUnit.MILLISECONDS)
-    }
-
-    // A call that ran out of time (its read-idle timeout, or its deadline and grace) may be stuck on a dead connection.
+    // A call that ran out of time (its read-idle timeout, or its deadline) may be stuck on a dead connection.
     // It is taken to be if nothing has arrived from the call's origin, on any call, since the call last received
     // anything; otherwise only that call was slow. Cronet has no call that closes one connection, so the engine's
     // CronetEngine is retired: new calls go to a fresh one, which dials its own connections, and the old one shuts down

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:connectrpc/connect.dart';
 import 'package:flutter/foundation.dart';
@@ -134,15 +135,14 @@ final class _Dispatcher {
   /// Asks the plugin to cancel call [id]; its `canceled` event then ends the call. Should the plugin fail to take the
   /// request, no event will come, so the call ends here instead.
   ///
-  /// With [deadlineGrace], the call has hit its deadline and already failed here. The plugin then waits up to that long
-  /// before canceling it, for anything from the call's origin: the server's own `deadline_exceeded`, typically, since
-  /// connect-dart sends the deadline and the server's clock starts later. If nothing arrives, the call is taken to be
-  /// stuck on a dead connection, and new calls move to a fresh one.
-  Future<void> cancel(int id, {Duration? deadlineGrace}) async {
+  /// With [evictConnection], the call hit its deadline without the server's own `deadline_exceeded`, which a live
+  /// connection would have delivered first (see [serverTimeoutMs]). The plugin then moves new calls off the call's
+  /// connection, unless something else from the call's origin has arrived since the call last received anything.
+  Future<void> cancel(int id, {bool evictConnection = false}) async {
     try {
       await bridge.methods.invokeMethod<void>('cancel', {
         'callId': id,
-        if (deadlineGrace != null) 'deadlineGraceMs': deadlineGrace.inMilliseconds,
+        if (evictConnection) 'evictConnection': true,
       });
     } catch (error, stack) {
       final call = remove(id);
@@ -239,9 +239,22 @@ final class _Dispatcher {
   }
 }
 
-/// How long the plugin keeps a call that hit its deadline, waiting for a sign its connection is alive. Covers the
-/// server's own `deadline_exceeded`, which arrives about a round trip after the client's deadline.
-const deadlineGrace = Duration(seconds: 1);
+/// What each hop takes off the deadline it passes on: the server gets a deadline this much shorter than the client's
+/// own, so on a live connection its `deadline_exceeded` arrives before the client's deadline fires.
+const deadlineStep = Duration(seconds: 1);
+
+/// The `connect-timeout-ms` to send for a call whose deadline is [ms] away: [deadlineStep] less, or half of [ms] when
+/// that is less, so the server never gets zero.
+int serverTimeoutMs(int ms) => ms - math.min(deadlineStep.inMilliseconds, ms ~/ 2);
+
+/// connect-dart's deadline header, which it sets from the call's signal.
+const _connectTimeoutHeader = 'connect-timeout-ms';
+
+/// A `connect-timeout-ms` value with [serverTimeoutMs] applied; anything but a positive number passes unchanged.
+String _stepDown(String value) => switch (int.tryParse(value)) {
+  final ms? when ms > 0 => '${serverTimeoutMs(ms)}',
+  _ => value,
+};
 
 /// A connect-dart [HttpClient] on one engine of a [PlatformBridge] plugin.
 base class ChannelHttpClient implements NativeHttpClient {
@@ -289,15 +302,8 @@ base class ChannelHttpClient implements NativeHttpClient {
         return;
       }
       call.abortError = error;
-      if (error.code == Code.deadlineExceeded) {
-        // The caller gets the deadline now; the plugin keeps the stream a little longer to tell whether its connection
-        // is dead (see _Dispatcher.cancel), and nothing it reports for the call matters any more.
-        dispatcher.remove(id);
-        call.fail(error);
-        unawaited(dispatcher.cancel(id, deadlineGrace: deadlineGrace));
-        return;
-      }
-      unawaited(dispatcher.cancel(id));
+      // The server's deadline was a step earlier, so a deadline that fires here never got the server's answer.
+      unawaited(dispatcher.cancel(id, evictConnection: error.code == Code.deadlineExceeded));
     });
     try {
       await methods.invokeMethod<void>('open', {
@@ -306,7 +312,8 @@ base class ChannelHttpClient implements NativeHttpClient {
         'url': req.url,
         'method': req.method,
         'headers': [
-          for (final (:name, :value) in req.header.entries) [name, value],
+          for (final (:name, :value) in req.header.entries)
+            [name, name == _connectTimeoutHeader ? _stepDown(value) : value],
         ],
         'hasBody': req.body != null,
         'readIdleTimeoutMs': _readIdleTimeoutMs,

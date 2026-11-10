@@ -248,30 +248,45 @@ void main() {
     await expectLater(response, throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.canceled)));
   });
 
-  test('a deadline fails the call at once, and gives the plugin time to check the connection', () async {
+  test("a deadline cancels the stream and asks the plugin to leave the call's connection", () async {
     final signal = TimeoutSignal(const Duration(milliseconds: 10));
     final response = client.httpClient(request(StreamController<Uint8List>().stream, signal: signal));
     await settle();
     final id = plugin.lastCallId;
-    // No canceled event: the call ends without waiting for the plugin.
-    await expectLater(
-      response.timeout(const Duration(seconds: 1)),
-      throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
-    );
+    await Future<void>.delayed(const Duration(milliseconds: 50));
     final cancel = plugin.callsTo('cancel').single.arguments as Map;
     expect(cancel['callId'], id);
-    expect(cancel['deadlineGraceMs'], 1000);
-    // The plugin's later events for the call change nothing.
+    expect(cancel['evictConnection'], isTrue);
     await plugin.emit({'callId': id, 'type': 'canceled'});
+    await expectLater(response, throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)));
   });
 
-  test('a signal that is not a deadline cancels at once', () async {
+  test('a signal that is not a deadline leaves the connection alone', () async {
     final signal = CancelableSignal();
     unawaited(client.httpClient(request(null, signal: signal)).then((_) {}, onError: (_) {}));
     await settle();
     signal.cancel('stop');
     await settle();
-    expect((plugin.callsTo('cancel').single.arguments as Map).containsKey('deadlineGraceMs'), isFalse);
+    expect((plugin.callsTo('cancel').single.arguments as Map).containsKey('evictConnection'), isFalse);
+  });
+
+  test("the server's deadline is a step shorter than the client's", () async {
+    Future<String?> sent(String timeout) async {
+      final headers = Headers()
+        ..add('content-type', 'application/proto')
+        ..add('connect-timeout-ms', timeout);
+      final req = HttpRequest('https://example.test/svc/Method', 'POST', headers, null, null);
+      unawaited(client.httpClient(req).then((_) {}, onError: (_) {}));
+      await settle();
+      final pairs = (plugin.callsTo('open').last.arguments as Map)['headers'] as List;
+      return pairs.cast<List<Object?>>().firstWhere((pair) => pair[0] == 'connect-timeout-ms')[1] as String?;
+    }
+
+    expect(await sent('5000'), '4000');
+    // Under two steps, half: the server never gets zero.
+    expect(await sent('1500'), '750');
+    expect(await sent('1'), '1');
+    expect(await sent('soon'), 'soon');
   });
 
   test('cancelling the response body cancels the native stream', () async {

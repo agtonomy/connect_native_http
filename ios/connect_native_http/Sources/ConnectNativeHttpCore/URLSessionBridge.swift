@@ -144,15 +144,17 @@ public final class URLSessionBridge {
       reply(.success(nil))
     case "cancel":
       let callId: Int = try arg(args, "callId")
-      // Set when the call hit its deadline: see `cancelAfterDeadline`.
-      let deadlineGraceMs = try optionalPositiveInt(args, "deadlineGraceMs")
+      // Set when the call hit its deadline. The server was given a deadline a step earlier, so on a live connection
+      // its deadline_exceeded would have ended the call first.
+      let value = args["evictConnection"]
+      guard value == nil || value is NSNull || value is Bool else { throw BadArgument(name: "evictConnection") }
+      let evict = value as? Bool ?? false
       queue.async {
         guard let c = self.calls[callId] else { return }
-        if let deadlineGraceMs {
-          self.cancelAfterDeadline(c, graceMs: deadlineGraceMs)
-        } else {
-          c.task.cancel()
+        if evict {
+          self.evictConnection(of: c)
         }
+        c.task.cancel()
       }
       reply(.success(nil))
     default:
@@ -317,7 +319,7 @@ public final class URLSessionBridge {
     emit(failure(c.callId, domain: error.domain, code: error.code, message: error.localizedDescription))
   }
 
-  // A call that ran out of time (its read-idle timeout, or its deadline and grace) may be stuck on a dead connection.
+  // A call that ran out of time (its read-idle timeout, or its deadline) may be stuck on a dead connection.
   // It is taken to be if nothing has arrived from the call's origin, on any call, since the call last received
   // anything; otherwise only that call was slow. URLSession pools connections per session and has no call that closes
   // one, so the engine's new calls go to a fresh URLSession, which dials its own connections. The old one finishes the
@@ -331,19 +333,6 @@ public final class URLSessionBridge {
     session.urlSession = makeURLSession()
     session.lastReceived = [:]
     old.finishTasksAndInvalidate()
-  }
-
-  // The call has hit its deadline and Dart has already failed it. The server enforces the same deadline and answers
-  // about a round trip later, so the task stays open for the grace period: an answer, or anything else from the
-  // origin, shows the connection is alive. After it, the task is canceled, and the connection evicted if it stayed
-  // quiet.
-  private func cancelAfterDeadline(_ c: Call, graceMs: Int) {
-    queue.asyncAfter(deadline: .now() + .milliseconds(graceMs)) {
-      // Gone: the server's answer ended it, or the stack failed it.
-      guard self.calls[c.callId] === c else { return }
-      self.evictConnection(of: c)
-      c.task.cancel()
-    }
   }
 
   fileprivate func serverTrust(_ challenge: URLAuthenticationChallenge) -> (

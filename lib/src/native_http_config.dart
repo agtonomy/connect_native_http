@@ -47,7 +47,8 @@ final class NativeHttpConfig {
   /// - **The connection:** if nothing has arrived from the call's origin, on any call, since the call last received
   ///   anything, the connection is taken to be dead. The client moves new calls to a fresh `URLSession` or Cronet
   ///   engine, so they dial a new connection, and lets the calls already on the old one finish there. A call that hits
-  ///   its deadline is checked the same way, after a 1 s grace period for the server's own `deadline_exceeded`.
+  ///   its deadline is checked the same way: the server is sent a deadline a step shorter, so on a live connection its
+  ///   `deadline_exceeded` arrives first.
   final Duration? readIdleTimeout;
 
   /// Called with each response's headers, before its body is read. An exception it throws goes to

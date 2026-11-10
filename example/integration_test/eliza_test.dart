@@ -415,8 +415,7 @@ void main() {
       h2.eliza.say(SayRequest(sentence: 'hi'), signal: TimeoutSignal(const Duration(seconds: 2))),
       throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
     );
-    // Nothing arrives in the grace period after the deadline, so the next call dials a new connection.
-    await Future<void>.delayed(const Duration(milliseconds: 1500));
+    // The server's deadline_exceeded never came, so the next call dials a new connection.
     final res = await h2.eliza.say(
       SayRequest(sentence: 'after'),
       signal: TimeoutSignal(const Duration(seconds: 8)),
@@ -428,19 +427,21 @@ void main() {
     await requests.close();
   }, timeout: http2CaseTimeout);
 
-  testCase('a deadline the server answers keeps the connection', (_) async {
-    // connect-dart sends the deadline, and the server answers deadline_exceeded about a round trip after the client's
-    // own deadline, within the grace period: the connection is alive.
+  testCase('the server answers a deadline a step early, and the connection is kept', (_) async {
+    // The server gets a deadline a second shorter than the client's, so its deadline_exceeded ends the call before the
+    // client's own deadline fires, and shows the connection is alive.
     if (skipUnlessAdmin()) {
       return;
     }
     final h2 = await harnessOverHttp2();
     final liveAddr = h2.remoteAddrs.last;
+    final stopwatch = Stopwatch()..start();
     await expectLater(
-      h2.eliza.say(SayRequest(sentence: 'sleep:5000'), signal: TimeoutSignal(const Duration(seconds: 1))),
+      h2.eliza.say(SayRequest(sentence: 'sleep:5000'), signal: TimeoutSignal(const Duration(seconds: 3))),
       throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
     );
-    await Future<void>.delayed(const Duration(milliseconds: 1500));
+    // The server's 2 s, not the client's 3 s.
+    expect(stopwatch.elapsed, lessThan(const Duration(milliseconds: 2800)));
     await h2.eliza.say(SayRequest(sentence: 'after'), onHeader: h2.recordHeaders);
     expect(h2.remoteAddrs.last, liveAddr);
   }, timeout: http2CaseTimeout);
