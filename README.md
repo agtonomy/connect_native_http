@@ -166,9 +166,10 @@ found or verified with the tests in this package.
 | Stack | URLSession, through the Swift plugin in `ios/` (Swift Package Manager only) | Cronet `BidirectionalStream`, through the Kotlin plugin in `android/` |
 | HTTP/3 | From the first request for `http3Origins`; otherwise learned from `Alt-Svc` | Same |
 | Certificates | System trust store | System trust store; QUIC only with certificates that chain to a public root |
-| Negotiated protocol | Not exposed (`NativeHttpResponseInfo.protocol` is `null`) | `h2`, `quic/1+spdy/3` (HTTP/3) or `http/1.1` |
+| Negotiated protocol | Not exposed (`NativeHttpResponseInfo.protocol` is `null`) | `h2` or `quic/1+spdy/3` (HTTP/3) |
 | QUIC idle timeout | No setting; the server's advertised value applies | `NativeHttpConfig.quicIdleTimeout`, in whole seconds |
 | Read-idle timeout | `NativeHttpConfig.readIdleTimeout`, through `URLRequest.timeoutInterval`. Without one, a task that receives nothing for a day fails | `NativeHttpConfig.readIdleTimeout`, through a timer in the bridge. None without one |
+| HTTP/1.1 and `http://` | Left to URLSession; not tested | Not carried: Cronet's `BidirectionalStream` fails a call unless HTTP/2 or HTTP/3 is negotiated (`net::ERR_FAILED`), and takes only `https://` URLs (`net::ERR_DISALLOWED_URL_SCHEME`) |
 | Redirects | Followed only for requests without a body; otherwise the 3xx response is returned, since a streamed body can't be resent | Not tested |
 
 ### Dead connections

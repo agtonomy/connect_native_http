@@ -96,7 +96,7 @@ public final class URLSessionBridge {
     case "createEngine":
       let origins = try (args["http3Origins"] as? [[Any]] ?? []).map { origin -> String in
         guard origin.count == 2 else { throw BadArgument(name: "http3Origins") }
-        return "\(origin[0]):\(origin[1])"
+        return "\(origin[0])".lowercased() + ":\(origin[1])"
       }
       queue.async {
         let id = self.nextSessionId
@@ -213,7 +213,8 @@ public final class URLSessionBridge {
       request.addValue(h[1], forHTTPHeaderField: h[0])
     }
     let port = target.port ?? (target.scheme == "http" ? 80 : 443)
-    let origin = "\(target.host ?? ""):\(port)"
+    // Lowercased, as Dart's Uri gives the hosts in http3Origins; URL keeps the case the caller wrote.
+    let origin = "\((target.host ?? "").lowercased()):\(port)"
     request.assumesHTTP3Capable = session.http3Origins.contains(origin)
     // The request's read-idle timeout: URLSession fails the task once it has received nothing for this long, with
     // NSURLErrorTimedOut.

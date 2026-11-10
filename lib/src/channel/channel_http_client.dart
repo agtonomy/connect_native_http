@@ -49,7 +49,11 @@ Headers plainHeaders(List<(String, String)> pairs) {
 }
 
 final class _Call {
-  _Call(this.url);
+  _Call(this.url) {
+    // A failure event can arrive before the `open` reply, so before `_send` has handed this future to its caller.
+    // The caller still gets the error; this keeps it from also being reported as unhandled in the meantime.
+    response.future.ignore();
+  }
 
   final Uri url;
   final response = Completer<HttpResponse>();
