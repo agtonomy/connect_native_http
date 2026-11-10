@@ -38,12 +38,20 @@ const introduceInterval = Duration(milliseconds: 100);
 final class Harness {
   Harness._(this.native, this.eliza);
 
-  static Future<Harness> create(String baseUrl, {Set<Uri> http3Origins = const {}, Duration? readIdleTimeout}) async {
+  static Future<Harness> create(
+    String baseUrl, {
+    Set<Uri> http3Origins = const {},
+    Duration? readIdleTimeout,
+    Duration? deadlineStep,
+    bool evictOnDeadline = false,
+  }) async {
     late final Harness harness;
     final native = await NativeHttpClient.create(
       NativeHttpConfig(
         http3Origins: http3Origins,
         readIdleTimeout: readIdleTimeout,
+        deadlineStep: deadlineStep,
+        evictOnDeadline: evictOnDeadline,
         onResponse: (info) => harness.platformProtocols.add(info.protocol),
       ),
     );
@@ -131,10 +139,19 @@ Future<Harness> harnessNegotiating(String protocol) async {
 
 /// A client on HTTP/2, with the server's UDP frozen for the rest of the case so that QUIC can't connect: URLSession
 /// then falls back to TCP, as on a network that blocks UDP. Android is on HTTP/2 with this server anyway.
-Future<Harness> harnessOverHttp2({Duration? readIdleTimeout}) async {
+Future<Harness> harnessOverHttp2({
+  Duration? readIdleTimeout,
+  Duration? deadlineStep,
+  bool evictOnDeadline = false,
+}) async {
   addTearDown(() => admin('/unfreeze'));
   await admin('/freeze?for=60s');
-  final harness = await Harness.create(serverUrl, readIdleTimeout: readIdleTimeout);
+  final harness = await Harness.create(
+    serverUrl,
+    readIdleTimeout: readIdleTimeout,
+    deadlineStep: deadlineStep,
+    evictOnDeadline: evictOnDeadline,
+  );
   addTearDown(harness.native.close);
   await harness.eliza.say(
     SayRequest(sentence: 'which protocol'),
@@ -397,12 +414,12 @@ void main() {
   }, timeout: http2CaseTimeout);
 
   testCase('a dead HTTP/2 connection is reused until a call runs out of time on it', (_) async {
-    // Nothing notices the dead connection by itself; the first call to run out of time, here on its deadline, moves
-    // the client off it.
+    // Nothing notices the dead connection by itself; with evictOnDeadline, the first call to run out of time, here on
+    // its deadline, moves the client off it.
     if (skipUnlessAdmin()) {
       return;
     }
-    final h2 = await harnessOverHttp2();
+    final h2 = await harnessOverHttp2(deadlineStep: const Duration(seconds: 1), evictOnDeadline: true);
     final (requests, responses) = await openQuietConverse(h2);
     final deadAddr = h2.remoteAddrs.last;
     await admin('/freeze?for=60s&path=tcp');
@@ -428,12 +445,12 @@ void main() {
   }, timeout: http2CaseTimeout);
 
   testCase('the server answers a deadline a step early, and the connection is kept', (_) async {
-    // The server gets a deadline a second shorter than the client's, so its deadline_exceeded ends the call before the
-    // client's own deadline fires, and shows the connection is alive.
+    // With deadlineStep, the server gets a deadline a second shorter than the client's, so its deadline_exceeded ends
+    // the call before the client's own deadline fires, and shows the connection is alive.
     if (skipUnlessAdmin()) {
       return;
     }
-    final h2 = await harnessOverHttp2();
+    final h2 = await harnessOverHttp2(deadlineStep: const Duration(seconds: 1), evictOnDeadline: true);
     final liveAddr = h2.remoteAddrs.last;
     final stopwatch = Stopwatch()..start();
     await expectLater(

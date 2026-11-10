@@ -135,9 +135,9 @@ final class _Dispatcher {
   /// Asks the plugin to cancel call [id]; its `canceled` event then ends the call. Should the plugin fail to take the
   /// request, no event will come, so the call ends here instead.
   ///
-  /// With [evictConnection], the call hit its deadline without the server's own `deadline_exceeded`, which a live
-  /// connection would have delivered first (see [serverTimeoutMs]). The plugin then moves new calls off the call's
-  /// connection, unless something else from the call's origin has arrived since the call last received anything.
+  /// With [evictConnection], the call hit its deadline (see [NativeHttpConfig.evictOnDeadline]). The plugin then moves
+  /// new calls off the call's connection, unless something from the call's origin has arrived since the call last
+  /// received anything.
   Future<void> cancel(int id, {bool evictConnection = false}) async {
     try {
       await bridge.methods.invokeMethod<void>('cancel', {
@@ -239,20 +239,16 @@ final class _Dispatcher {
   }
 }
 
-/// What each hop takes off the deadline it passes on: the server gets a deadline this much shorter than the client's
-/// own, so on a live connection its `deadline_exceeded` arrives before the client's deadline fires.
-const deadlineStep = Duration(seconds: 1);
-
-/// The `connect-timeout-ms` to send for a call whose deadline is [ms] away: [deadlineStep] less, or half of [ms] when
-/// that is less, so the server never gets zero.
-int serverTimeoutMs(int ms) => ms - math.min(deadlineStep.inMilliseconds, ms ~/ 2);
+/// The `connect-timeout-ms` to send for a call whose deadline is [ms] away: [step] less, or half of [ms] when that is
+/// less, so the server never gets zero. See [NativeHttpConfig.deadlineStep].
+int serverTimeoutMs(int ms, Duration step) => ms - math.min(step.inMilliseconds, ms ~/ 2);
 
 /// connect-dart's deadline header, which it sets from the call's signal.
 const _connectTimeoutHeader = 'connect-timeout-ms';
 
 /// A `connect-timeout-ms` value with [serverTimeoutMs] applied; anything but a positive number passes unchanged.
-String _stepDown(String value) => switch (int.tryParse(value)) {
-  final ms? when ms > 0 => '${serverTimeoutMs(ms)}',
+String _stepDown(String value, Duration step) => switch (int.tryParse(value)) {
+  final ms? when ms > 0 => '${serverTimeoutMs(ms, step)}',
   _ => value,
 };
 
@@ -269,6 +265,10 @@ base class ChannelHttpClient implements NativeHttpClient {
     final readIdle = config.readIdleTimeout;
     if (readIdle != null && readIdle.isNegative) {
       throw ArgumentError.value(readIdle, 'readIdleTimeout', 'must not be negative');
+    }
+    final step = config.deadlineStep;
+    if (step != null && step.isNegative) {
+      throw ArgumentError.value(step, 'deadlineStep', 'must not be negative');
     }
     _Dispatcher.of(bridge);
     return (await bridge.methods.invokeMethod<int>('createEngine', arguments))!;
@@ -290,6 +290,7 @@ base class ChannelHttpClient implements NativeHttpClient {
   Future<HttpResponse> _send(HttpRequest req) async {
     final dispatcher = _Dispatcher.of(_bridge);
     final methods = _bridge.methods;
+    final step = _config.deadlineStep == Duration.zero ? null : _config.deadlineStep;
     final call = _Call(Uri.parse(req.url));
     final id = dispatcher.register(call, _config.onResponse);
     call.body.onCancel = () {
@@ -302,8 +303,8 @@ base class ChannelHttpClient implements NativeHttpClient {
         return;
       }
       call.abortError = error;
-      // The server's deadline was a step earlier, so a deadline that fires here never got the server's answer.
-      unawaited(dispatcher.cancel(id, evictConnection: error.code == Code.deadlineExceeded));
+      final evict = _config.evictOnDeadline && error.code == Code.deadlineExceeded;
+      unawaited(dispatcher.cancel(id, evictConnection: evict));
     });
     try {
       await methods.invokeMethod<void>('open', {
@@ -313,7 +314,7 @@ base class ChannelHttpClient implements NativeHttpClient {
         'method': req.method,
         'headers': [
           for (final (:name, :value) in req.header.entries)
-            [name, name == _connectTimeoutHeader ? _stepDown(value) : value],
+            [name, name == _connectTimeoutHeader && step != null ? _stepDown(value, step) : value],
         ],
         'hasBody': req.body != null,
         'readIdleTimeoutMs': _readIdleTimeoutMs,

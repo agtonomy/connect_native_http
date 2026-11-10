@@ -12,7 +12,14 @@ final class NativeHttpResponseInfo {
 /// Configuration shared by both platform clients. Server certificates are checked against the platform's trust
 /// store.
 final class NativeHttpConfig {
-  const NativeHttpConfig({this.http3Origins = const {}, this.quicIdleTimeout, this.readIdleTimeout, this.onResponse});
+  const NativeHttpConfig({
+    this.http3Origins = const {},
+    this.quicIdleTimeout,
+    this.readIdleTimeout,
+    this.deadlineStep,
+    this.evictOnDeadline = false,
+    this.onResponse,
+  });
 
   /// `https://host:port` origins to try HTTP/3 with from the first request, before an `Alt-Svc` response header has
   /// advertised it. Both platforms fall back to HTTP/2 over TCP on their own when QUIC fails.
@@ -34,8 +41,8 @@ final class NativeHttpConfig {
   /// fallback, where nothing else notices a dead connection.
   ///
   /// It applies to every call, so leave it off on a client that carries streams which go quiet for long, or use a
-  /// second client for them. A call's own deadline (connect-dart's `TimeoutSignal` or `DeadlineSignal`) also moves new
-  /// calls off a dead connection; see "Calls that run out of time" in the README.
+  /// second client for them. For per-call bounds use deadlines (connect-dart's `TimeoutSignal` or `DeadlineSignal`),
+  /// with [evictOnDeadline] to move new calls off a dead connection.
   ///
   /// - **What resets it:** anything the call receives. It runs from when the call starts, so it also bounds the wait
   ///   for the response headers, and a unary call the server holds longer than this fails. A server stream that may go
@@ -46,10 +53,27 @@ final class NativeHttpConfig {
   ///   that `platformCode`.
   /// - **The connection:** if nothing has arrived from the call's origin, on any call, since the call last received
   ///   anything, the connection is taken to be dead. The client moves new calls to a fresh `URLSession` or Cronet
-  ///   engine, so they dial a new connection, and lets the calls already on the old one finish there. A call that hits
-  ///   its deadline is checked the same way: the server is sent a deadline a step shorter, so on a live connection its
-  ///   `deadline_exceeded` arrives first.
+  ///   engine, so they dial a new connection, and lets the calls already on the old one finish there.
   final Duration? readIdleTimeout;
+
+  /// How much shorter a deadline the server gets than the call's own. connect-dart sends a call's deadline in
+  /// `connect-timeout-ms`; with this set, the client sends that much less, or half the deadline when that is less, so
+  /// the server never gets zero. `null` or [Duration.zero] sends the deadline as it is.
+  ///
+  /// A reachable server then times the call out first, and its `deadline_exceeded` arrives before the client's own
+  /// deadline fires. So a deadline that does fire on the client means the server's answer never came, which is what
+  /// makes [evictOnDeadline] reliable. Servers that call further services should take their own step off the deadline
+  /// they pass on.
+  final Duration? deadlineStep;
+
+  /// Whether a call that hits its deadline on the client moves new calls off its connection, as a [readIdleTimeout]
+  /// does: if nothing has arrived from the call's origin, on any call, since the call last received anything, new
+  /// calls go to a fresh `URLSession` or Cronet engine. Calls already on the old connection are not canceled.
+  ///
+  /// Use it with [deadlineStep]. Without one, the server enforces the same deadline as the client, but its clock
+  /// starts later, so on a healthy connection the client's deadline usually fires before the server's
+  /// `deadline_exceeded` arrives, and the connection is evicted for nothing.
+  final bool evictOnDeadline;
 
   /// Called with each response's headers, before its body is read. An exception it throws goes to
   /// `FlutterError.onError`, and the call goes on.

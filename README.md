@@ -62,8 +62,8 @@ NativeHttpConfig(readIdleTimeout: const Duration(seconds: 30));
 ```
 
 It applies to every call on the client. For per-call bounds use deadlines (connect-dart's `TimeoutSignal` or
-`DeadlineSignal`), which also move the client off a dead connection (see "Calls that run out of time"). Streams that
-go quiet for long need a client without a read-idle timeout, or periodic messages.
+`DeadlineSignal`), which can also move the client off a dead connection (see "Calls that run out of time"). Streams
+that go quiet for long need a client without a read-idle timeout, or periodic messages.
 
 - **What it measures:** time since the call last received anything: headers, a body chunk or trailers. The timer starts
   when the call does, so it also bounds the wait for the response headers. A unary call the server holds longer than
@@ -78,18 +78,30 @@ go quiet for long need a client without a read-idle timeout, or periodic message
 
 ### Calls that run out of time
 
-A call that hits its read-idle timeout or its deadline may be stuck on a dead connection. The client keeps new calls
-off such a connection, so they don't wait on it too.
+A call that hits its read-idle timeout, or its deadline with `evictOnDeadline`, may be stuck on a dead connection.
+The client keeps new calls off such a connection, so they don't wait on it too.
+
+```dart
+NativeHttpConfig(
+  readIdleTimeout: const Duration(seconds: 30), // optional
+  deadlineStep: const Duration(seconds: 1),
+  evictOnDeadline: true,
+);
+```
 
 - **Read-idle timeout:** the connection counts as dead if nothing has arrived from the call's origin (host and port),
   on any call, since the call last received anything. If something has, the connection is alive and only that call
   was slow, so nothing changes.
-- **Deadline:** each hop takes a step off the deadline it passes on. connect-dart sends the call's deadline in
-  `connect-timeout-ms`, and the client sends the server 1 s less, or half the deadline when that is less, so the
-  server never gets zero. A server that is reachable then times the call out first and answers `deadline_exceeded`
-  before the client's own deadline fires. So when the client's deadline fires, the server's answer never came, and the
-  connection counts as dead under the same check as a read-idle timeout. Servers that call further services should
-  take their own step off the deadline they pass on.
+- **Deadline, with `evictOnDeadline`:** the connection counts as dead under the same check as a read-idle timeout.
+  Both options are off by default; use them together:
+  - **`deadlineStep`** takes a step off the deadline each hop passes on. connect-dart sends the call's deadline in
+    `connect-timeout-ms`, and the client sends the server that much less, or half the deadline when that is less, so
+    the server never gets zero. A reachable server then times the call out first and answers `deadline_exceeded`
+    before the client's own deadline fires. So when the client's deadline fires, the server's answer never came.
+    Servers that call further services should take their own step off the deadline they pass on.
+  - **Without a step,** the server enforces the same deadline, but its clock starts later. On a healthy connection the
+    client's deadline usually fires first, and with `evictOnDeadline` alone the connection would be evicted for
+    nothing.
 - **A dead connection is evicted.** Neither stack can close a single connection, so the client moves its new calls to
   a fresh `URLSession` or `CronetEngine`, which dials its own connections. Calls already on the old one are not
   canceled. They finish there, and it is released after the last one ends. Several calls that run out of time on the
@@ -182,15 +194,15 @@ Clients may enforce a floor on the peer's value. quic-go's client raises anythin
 (`protocol.MinRemoteIdleTimeout`), so measure any other client before relying on a short server value.
 
 None of this works on the **HTTP/2 fallback** used where UDP is blocked. Neither stack exposes HTTP/2 pings, so a TCP
-connection that dies without the interface going down goes unnoticed until a call on it runs out of time: a deadline
-or a read-idle timeout (see "Calls that run out of time"). The integration tests check this:
+connection that dies without the interface going down goes unnoticed until a call on it runs out of time: a read-idle
+timeout, or a deadline with `evictOnDeadline` (see "Calls that run out of time"). The integration tests check this:
 
 - Over a frozen HTTP/2 connection nothing arrives for 3 s, and a new call on the same client waits on it until its
-  deadline. The call after that goes out on a new connection.
+  deadline. With `evictOnDeadline`, the call after that goes out on a new connection.
 - With a read-idle timeout, the call fails within the timeout, and the client's next call goes out on a new
   connection.
-- The server answers a deadline with `deadline_exceeded` a step before the client's own deadline, and the client
-  stays on the same connection.
+- With `deadlineStep`, the server answers a deadline with `deadline_exceeded` a step before the client's own
+  deadline, and the client stays on the same connection.
 
 ### QUIC idle timeout vs HTTP/2 keepalive pings
 
@@ -203,7 +215,7 @@ not over HTTP/2.
 | Who sets it | Both advertise a value; the connection uses the smaller (RFC 9000 §10.1) | Each side sets its own pings |
 | Can a server setting make the client notice? | Yes. A short server value becomes the client's timeout, and the server's pings stop arriving once the path dies. | No. A server that detects a dead connection can't tell the client, because nothing gets through. |
 | Through a load balancer | NLB QUIC passthrough is end to end, so the client sees the server's pings | An ALB ends HTTP/2 on each side, so the server's pings stop at the ALB. AWS doesn't document the ALB pinging clients, and nothing here relies on it. |
-| Client control here | Android: `quicIdleTimeout`. iOS: none. Both: a read-idle timeout, and eviction after a deadline. | No pings: neither URLSession nor Cronet exposes HTTP/2 ping settings. Both: a read-idle timeout, and eviction after a deadline. |
+| Client control here | Android: `quicIdleTimeout`. iOS: none. Both: a read-idle timeout, and `evictOnDeadline`. | No pings: neither URLSession nor Cronet exposes HTTP/2 ping settings. Both: a read-idle timeout, and `evictOnDeadline`. |
 | What a client that sends its own pings gets, for comparison | — | `package:http2` with 3 s pings and a 3 s timeout notices in about 6 s |
 
 So for servers:
@@ -288,10 +300,11 @@ Neither platform finishes a stream on its own while the client still has its req
   address in `X-Remote-Addr`, which shows whether two calls shared a connection. The cases check five things:
   - A quiet stream fails at its timeout.
   - A stream that keeps receiving outlives its timeout.
-  - A frozen connection draws no error, and new calls go to it until one hits its deadline. The call after that is
-    on a new connection.
+  - A frozen connection draws no error, and new calls go to it until one hits its deadline. With `evictOnDeadline`,
+    the call after that is on a new connection.
   - With a read-idle timeout, the call fails and the client's next call is on a new connection.
-  - The server answers a deadline a step before the client's, and the client stays on the same connection.
+  - With `deadlineStep`, the server answers a deadline a step before the client's, and the client stays on the same
+    connection.
 - **Native bridge tests:** the same script runs them after the Dart tests, against the same server. Each platform's
   bridge (`URLSessionBridge`, `CronetBridge`) has no Flutter dependency, and the tests call it directly, for behavior
   Dart can't reach:

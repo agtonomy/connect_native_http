@@ -248,30 +248,24 @@ void main() {
     await expectLater(response, throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.canceled)));
   });
 
-  test("a deadline cancels the stream and asks the plugin to leave the call's connection", () async {
-    final signal = TimeoutSignal(const Duration(milliseconds: 10));
-    final response = client.httpClient(request(StreamController<Uint8List>().stream, signal: signal));
-    await settle();
-    final id = plugin.lastCallId;
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-    final cancel = plugin.callsTo('cancel').single.arguments as Map;
-    expect(cancel['callId'], id);
-    expect(cancel['evictConnection'], isTrue);
-    await plugin.emit({'callId': id, 'type': 'canceled'});
-    await expectLater(response, throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)));
-  });
+  group('deadlines', () {
+    Future<Map<Object?, Object?>> cancelAfterDeadline(NativeHttpClient client) async {
+      final signal = TimeoutSignal(const Duration(milliseconds: 10));
+      final response = client.httpClient(request(StreamController<Uint8List>().stream, signal: signal));
+      await settle();
+      final id = plugin.lastCallId;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final cancel = plugin.callsTo('cancel').single.arguments as Map;
+      expect(cancel['callId'], id);
+      await plugin.emit({'callId': id, 'type': 'canceled'});
+      await expectLater(
+        response,
+        throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
+      );
+      return cancel;
+    }
 
-  test('a signal that is not a deadline leaves the connection alone', () async {
-    final signal = CancelableSignal();
-    unawaited(client.httpClient(request(null, signal: signal)).then((_) {}, onError: (_) {}));
-    await settle();
-    signal.cancel('stop');
-    await settle();
-    expect((plugin.callsTo('cancel').single.arguments as Map).containsKey('evictConnection'), isFalse);
-  });
-
-  test("the server's deadline is a step shorter than the client's", () async {
-    Future<String?> sent(String timeout) async {
+    Future<String?> sentTimeout(NativeHttpClient client, String timeout) async {
       final headers = Headers()
         ..add('content-type', 'application/proto')
         ..add('connect-timeout-ms', timeout);
@@ -282,11 +276,44 @@ void main() {
       return pairs.cast<List<Object?>>().firstWhere((pair) => pair[0] == 'connect-timeout-ms')[1] as String?;
     }
 
-    expect(await sent('5000'), '4000');
-    // Under two steps, half: the server never gets zero.
-    expect(await sent('1500'), '750');
-    expect(await sent('1'), '1');
-    expect(await sent('soon'), 'soon');
+    test('by default a deadline cancels the stream and leaves its connection alone', () async {
+      expect((await cancelAfterDeadline(client)).containsKey('evictConnection'), isFalse);
+    });
+
+    test("with evictOnDeadline, a deadline asks the plugin to leave the call's connection", () async {
+      final evicting = await CronetHttpClient.create(const NativeHttpConfig(evictOnDeadline: true));
+      expect((await cancelAfterDeadline(evicting))['evictConnection'], isTrue);
+    });
+
+    test('a signal that is not a deadline leaves the connection alone', () async {
+      final evicting = await CronetHttpClient.create(const NativeHttpConfig(evictOnDeadline: true));
+      final signal = CancelableSignal();
+      unawaited(evicting.httpClient(request(null, signal: signal)).then((_) {}, onError: (_) {}));
+      await settle();
+      signal.cancel('stop');
+      await settle();
+      expect((plugin.callsTo('cancel').single.arguments as Map).containsKey('evictConnection'), isFalse);
+    });
+
+    test('by default the server gets the deadline as it is', () async {
+      expect(await sentTimeout(client, '5000'), '5000');
+    });
+
+    test("with deadlineStep, the server's deadline is a step shorter than the client's", () async {
+      final stepping = await CronetHttpClient.create(const NativeHttpConfig(deadlineStep: Duration(seconds: 1)));
+      expect(await sentTimeout(stepping, '5000'), '4000');
+      // Under two steps, half: the server never gets zero.
+      expect(await sentTimeout(stepping, '1500'), '750');
+      expect(await sentTimeout(stepping, '1'), '1');
+      expect(await sentTimeout(stepping, 'soon'), 'soon');
+    });
+
+    test('a negative step is refused', () async {
+      await expectLater(
+        CronetHttpClient.create(const NativeHttpConfig(deadlineStep: Duration(seconds: -1))),
+        throwsArgumentError,
+      );
+    });
   });
 
   test('cancelling the response body cancels the native stream', () async {
