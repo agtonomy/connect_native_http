@@ -54,16 +54,16 @@ native library fails to load.
 
 ### Read-idle timeout
 
-A call can fail once it has received nothing from the server for a set time. This is the only way either client
-notices a dead HTTP/2 connection (see "Dead connections"). Set it per call, or as a default for every call:
+A client can fail each of its calls once the call has received nothing from the server for a set time. Apart from
+deadlines, this is the only way either client notices a dead HTTP/2 connection (see "Dead connections"):
 
 ```dart
-// One call. An interceptor can set it per procedure the same way.
-await eliza.say(request, headers: Headers()..setReadIdleTimeout(const Duration(seconds: 10)));
-
-// Every call that doesn't set its own. Duration.zero on a call turns the default off for that call.
 NativeHttpConfig(readIdleTimeout: const Duration(seconds: 30));
 ```
+
+It applies to every call on the client. For per-call bounds use deadlines (connect-dart's `TimeoutSignal` or
+`DeadlineSignal`), which also move the client off a dead connection (see "Calls that run out of time"). Streams that
+go quiet for long need a client without a read-idle timeout, or periodic messages.
 
 - **What it measures:** time since the call last received anything: headers, a body chunk or trailers. The timer starts
   when the call does, so it also bounds the wait for the response headers. A unary call the server holds longer than
@@ -75,8 +75,6 @@ NativeHttpConfig(readIdleTimeout: const Duration(seconds: 30));
   iOS or `net::ERR_TIMED_OUT` (-7) on Android. On Android a timeout before `onStreamReady` is `notSent`, as with any
   other failure there.
 - **The connection:** see "Calls that run out of time" below.
-- **The header:** the value travels in a `native-http-read-idle-timeout-ms` request header (`readIdleTimeoutHeader`),
-  which the client removes before sending. connect-dart's `CallOptions` carry nothing else per call.
 
 ### Calls that run out of time
 
@@ -157,7 +155,7 @@ found or verified with the tests in this package.
 | Certificates | System trust store | System trust store; QUIC only with certificates that chain to a public root |
 | Negotiated protocol | Not exposed (`NativeHttpResponseInfo.protocol` is `null`) | `h2`, `quic/1+spdy/3` (HTTP/3) or `http/1.1` |
 | QUIC idle timeout | No setting; the server's advertised value applies | `NativeHttpConfig.quicIdleTimeout`, in whole seconds |
-| Read-idle timeout | Per call, through `URLRequest.timeoutInterval`. Without one, a task that receives nothing for a day fails | Per call, through a timer in the bridge. None without one |
+| Read-idle timeout | `NativeHttpConfig.readIdleTimeout`, through `URLRequest.timeoutInterval`. Without one, a task that receives nothing for a day fails | `NativeHttpConfig.readIdleTimeout`, through a timer in the bridge. None without one |
 | Redirects | Followed only for requests without a body; otherwise the 3xx response is returned, since a streamed body can't be resent | Not tested |
 
 ### Dead connections
@@ -203,7 +201,7 @@ not over HTTP/2.
 | Who sets it | Both advertise a value; the connection uses the smaller (RFC 9000 §10.1) | Each side sets its own pings |
 | Can a server setting make the client notice? | Yes. A short server value becomes the client's timeout, and the server's pings stop arriving once the path dies. | No. A server that detects a dead connection can't tell the client, because nothing gets through. |
 | Through a load balancer | NLB QUIC passthrough is end to end, so the client sees the server's pings | An ALB ends HTTP/2 on each side, so the server's pings stop at the ALB. AWS doesn't document the ALB pinging clients, and nothing here relies on it. |
-| Client control here | Android: `quicIdleTimeout`. iOS: none. Both: a read-idle timeout per call. | No pings: neither URLSession nor Cronet exposes HTTP/2 ping settings. Both: a read-idle timeout per call. |
+| Client control here | Android: `quicIdleTimeout`. iOS: none. Both: a read-idle timeout, and eviction after a deadline. | No pings: neither URLSession nor Cronet exposes HTTP/2 ping settings. Both: a read-idle timeout, and eviction after a deadline. |
 | What a client that sends its own pings gets, for comparison | — | `package:http2` with 3 s pings and a 3 s timeout notices in about 6 s |
 
 So for servers:

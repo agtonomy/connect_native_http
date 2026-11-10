@@ -7,7 +7,6 @@ import 'package:flutter/services.dart';
 import '../native_http_client.dart';
 import '../native_http_config.dart';
 import '../native_http_exception.dart';
-import '../read_idle_timeout.dart';
 import 'connect_end_stream.dart';
 
 /// A platform plugin that speaks this file's channel protocol: `createEngine`, `shutdownEngine`, `open`, `write`,
@@ -266,18 +265,18 @@ base class ChannelHttpClient implements NativeHttpClient {
   final int _engineId;
   final NativeHttpConfig _config;
 
+  /// [NativeHttpConfig.readIdleTimeout] in whole milliseconds, rounded up so a sub-millisecond timeout isn't none.
+  late final int? _readIdleTimeoutMs = switch (_config.readIdleTimeout) {
+    null || Duration.zero => null,
+    final timeout => (timeout.inMicroseconds / 1000).ceil(),
+  };
+
   @override
   HttpClient get httpClient => _send;
 
   Future<HttpResponse> _send(HttpRequest req) async {
     final dispatcher = _Dispatcher.of(_bridge);
     final methods = _bridge.methods;
-    final int? readIdleMs;
-    try {
-      readIdleMs = readIdleTimeoutMs(req.header, _config.readIdleTimeout);
-    } on FormatException catch (error) {
-      throw ConnectException(Code.internal, '${_bridge.name}: ${error.message}: ${error.source}', cause: error);
-    }
     final call = _Call(Uri.parse(req.url));
     final id = dispatcher.register(call, _config.onResponse);
     call.body.onCancel = () {
@@ -307,11 +306,10 @@ base class ChannelHttpClient implements NativeHttpClient {
         'url': req.url,
         'method': req.method,
         'headers': [
-          for (final (:name, :value) in req.header.entries)
-            if (name != readIdleTimeoutHeader) [name, value],
+          for (final (:name, :value) in req.header.entries) [name, value],
         ],
         'hasBody': req.body != null,
-        'readIdleTimeoutMs': readIdleMs,
+        'readIdleTimeoutMs': _readIdleTimeoutMs,
       });
     } catch (error) {
       // The plugin refused the call, or isn't there (a background isolate, say): nothing was sent.

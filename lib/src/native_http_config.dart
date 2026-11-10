@@ -29,9 +29,13 @@ final class NativeHttpConfig {
   /// Android only. URLSession exposes no QUIC settings, so on iOS only the server's advertised idle timeout applies.
   final Duration? quicIdleTimeout;
 
-  /// The read-idle timeout of calls that don't set their own with `Headers.setReadIdleTimeout`: a call fails once it
-  /// has received nothing from the server for this long. `null` or [Duration.zero] means none. Both platforms apply it
-  /// per call, so it also works on the HTTP/2 fallback, where nothing else notices a dead connection.
+  /// Fails each of this client's calls once it has received nothing from the server for this long. `null` or
+  /// [Duration.zero] means none. Each call has its own timer in the platform client, so it also works on the HTTP/2
+  /// fallback, where nothing else notices a dead connection.
+  ///
+  /// It applies to every call, so leave it off on a client that carries streams which go quiet for long, or use a
+  /// second client for them. A call's own deadline (connect-dart's `TimeoutSignal` or `DeadlineSignal`) also moves new
+  /// calls off a dead connection; see "Calls that run out of time" in the README.
   ///
   /// - **What resets it:** anything the call receives. It runs from when the call starts, so it also bounds the wait
   ///   for the response headers, and a unary call the server holds longer than this fails. A server stream that may go

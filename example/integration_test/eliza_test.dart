@@ -92,14 +92,9 @@ Future<void> admin(String path) async {
 }
 
 /// Opens Converse and reads the server's greeting. Nothing flows afterwards until the caller sends.
-Future<(StreamController<ConverseRequest>, StreamIterator<ConverseResponse>)> openQuietConverse(
-  Harness harness, {
-  Headers? headers,
-}) async {
+Future<(StreamController<ConverseRequest>, StreamIterator<ConverseResponse>)> openQuietConverse(Harness harness) async {
   final requests = StreamController<ConverseRequest>();
-  final responses = StreamIterator(
-    harness.eliza.converse(requests.stream, headers: headers, onHeader: harness.recordHeaders),
-  );
+  final responses = StreamIterator(harness.eliza.converse(requests.stream, onHeader: harness.recordHeaders));
   expect(await responses.moveNext(), isTrue);
   expect(responses.current.sentence, 'hello');
   return (requests, responses);
@@ -366,9 +361,9 @@ void main() {
     if (skipUnlessAdmin()) {
       return;
     }
-    final h2 = await harnessOverHttp2();
     const timeout = Duration(seconds: 1);
-    final (requests, responses) = await openQuietConverse(h2, headers: Headers()..setReadIdleTimeout(timeout));
+    final h2 = await harnessOverHttp2(readIdleTimeout: timeout);
+    final (requests, responses) = await openQuietConverse(h2);
     expect(h2.serverProtocols.last, 'HTTP/2.0');
 
     // Timed from the greeting, the last thing the stream received.
@@ -385,9 +380,9 @@ void main() {
     if (skipUnlessAdmin()) {
       return;
     }
-    final h2 = await harnessOverHttp2();
     const timeout = Duration(seconds: 1);
-    final (requests, responses) = await openQuietConverse(h2, headers: Headers()..setReadIdleTimeout(timeout));
+    final h2 = await harnessOverHttp2(readIdleTimeout: timeout);
+    final (requests, responses) = await openQuietConverse(h2);
     // Three times the timeout in all, but never more than 0.6 of it between replies.
     for (var i = 0; i < 5; i++) {
       await Future<void>.delayed(timeout * 0.6);
@@ -454,7 +449,6 @@ void main() {
     if (skipUnlessAdmin()) {
       return;
     }
-    // The client-wide default this time, rather than per call.
     const timeout = Duration(seconds: 2);
     final h2 = await harnessOverHttp2(readIdleTimeout: timeout);
     final (requests, responses) = await openQuietConverse(h2);
