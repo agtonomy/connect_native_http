@@ -4,8 +4,8 @@ final class NativeHttpResponseInfo {
 
   final Uri url;
 
-  /// The protocol the platform negotiated, as the platform names it: Cronet reports `h2`, `quic/1+spdy/3` (HTTP/3)
-  /// or `http/1.1`. `null` when the platform does not expose it, as with URLSession.
+  /// The protocol the platform negotiated, as the platform names it: Cronet reports `h2` or `quic/1+spdy/3` (HTTP/3).
+  /// `null` when the platform does not expose it, as with URLSession.
   final String? protocol;
 }
 

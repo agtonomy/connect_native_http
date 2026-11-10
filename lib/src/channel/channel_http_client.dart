@@ -49,7 +49,11 @@ Headers plainHeaders(List<(String, String)> pairs) {
 }
 
 final class _Call {
-  _Call(this.url);
+  _Call(this.url) {
+    // A failure event can arrive before the `open` reply, so before `_send` has handed this future to its caller.
+    // The caller still gets the error; this keeps it from also being reported as unhandled in the meantime.
+    response.future.ignore();
+  }
 
   final Uri url;
   final response = Completer<HttpResponse>();
@@ -121,7 +125,11 @@ final class _Dispatcher {
   final PlatformBridge bridge;
   final calls = <int, _Call>{};
   final _onResponse = <int, void Function(NativeHttpResponseInfo)?>{};
-  int _nextCallId = 1;
+
+  /// Starts at a random id rather than 1. A hot restart starts Dart afresh while the plugin's calls live on, and
+  /// would otherwise hand a new call the id of an old one, whose events it would then receive. Under 2^30, so ids stay
+  /// within the 32 bits the plugins read them as.
+  int _nextCallId = 1 + math.Random().nextInt(1 << 30);
 
   int register(_Call call, void Function(NativeHttpResponseInfo)? onResponse) {
     final id = _nextCallId++;

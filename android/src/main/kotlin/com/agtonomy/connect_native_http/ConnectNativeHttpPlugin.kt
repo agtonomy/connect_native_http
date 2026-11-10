@@ -43,6 +43,6 @@ class ConnectNativeHttpPlugin : FlutterPlugin {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         methods.setMethodCallHandler(null)
         events.setStreamHandler(null)
-        bridge.cancelAll()
+        bridge.close()
     }
 }

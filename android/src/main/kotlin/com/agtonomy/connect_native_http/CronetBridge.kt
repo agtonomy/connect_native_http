@@ -14,6 +14,7 @@ import java.net.URI
 import java.net.URISyntaxException
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -38,6 +39,7 @@ class CronetBridge(
     private val engines = HashMap<Int, Engine>()
     private val calls = HashMap<Int, Call>()
     private var nextEngineId = 1
+    private var closed = false
 
     private class EngineOptions(val quicHints: List<Pair<String, Int>>, val quicIdleTimeoutSeconds: Int?)
 
@@ -62,6 +64,10 @@ class CronetBridge(
         val pool: Pool,
         val origin: String,
         val readIdleTimeoutNanos: Long?,
+        // Whether the request has a body side to write to and end. Cronet ends a GET's or HEAD's with the headers, and
+        // a write after that, even the empty one that ends a request, aborts the process (a CHECK in Chromium's
+        // SpdyStream::SendData).
+        val writable: Boolean,
     ) {
         lateinit var stream: BidirectionalStream
 
@@ -81,19 +87,39 @@ class CronetBridge(
         var reported = false
     }
 
-    fun cancelAll() {
-        execute(null) {
-            calls.values.forEach { it.stream.cancel() }
+    // Ends the bridge when its Flutter engine goes away: cancels the calls in flight and shuts every engine down.
+    // Cronet's final callbacks for those calls still run on the bridge's thread, so it stops once the last engine has
+    // shut down.
+    fun close() {
+        try {
+            execute(null) {
+                closed = true
+                calls.values.forEach { it.stream.cancel() }
+                engines.keys.toList().forEach { id ->
+                    engines[id]?.shuttingDown = true
+                    shutdownIfIdle(id)
+                }
+                stopIfDone()
+            }
+        } catch (e: RejectedExecutionException) {
+            // Already closed, and stopped.
+        }
+    }
+
+    private fun stopIfDone() {
+        if (closed && engines.isEmpty()) {
+            executor.shutdown()
         }
     }
 
     // Runs [task] on the bridge's thread. An exception escaping it would end that thread, and with it the app: Android's
     // default handler for uncaught exceptions kills the process. So it is logged, and fails the call it concerns.
+    // Throwable, not Exception: allocating a buffer for a large chunk can throw OutOfMemoryError.
     private fun execute(callId: Int?, task: () -> Unit) {
         executor.execute {
             try {
                 task()
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "call $callId failed in the bridge", e)
                 if (callId != null) {
                     abort(callId, e)
@@ -213,7 +239,15 @@ class CronetBridge(
             return
         }
         val pool = engine.current
-        val c = Call(callId, engineId, pool, origin(url), readIdleTimeoutMs?.let { TimeUnit.MILLISECONDS.toNanos(it) })
+        val c = Call(
+            callId,
+            engineId,
+            pool,
+            origin(url),
+            readIdleTimeoutMs?.let { TimeUnit.MILLISECONDS.toNanos(it) },
+            // The methods Cronet itself takes to have no body (CronetBidirectionalStream.doesMethodAllowWriteData).
+            writable = method != "GET" && method != "HEAD",
+        )
         val builder = pool.cronet.newBidirectionalStreamBuilder(url, Callback(c), executor).setHttpMethod(method)
         for ((name, value) in headers) {
             builder.addHeader(name, value)
@@ -249,7 +283,7 @@ class CronetBridge(
         val check = Runnable {
             try {
                 checkReadIdle(c)
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "call ${c.callId} failed in the bridge", e)
                 abort(c.callId, e)
             }
@@ -308,7 +342,7 @@ class CronetBridge(
     }
 
     // Fails a call the bridge itself could not carry on with, after an exception on its thread.
-    private fun abort(callId: Int, e: Exception) {
+    private fun abort(callId: Int, e: Throwable) {
         val message = "connect_native_http bridge: $e"
         val c = calls[callId]
         if (c == null) {
@@ -329,8 +363,8 @@ class CronetBridge(
 
     private fun enqueue(c: Call, data: ByteArray, endOfStream: Boolean) {
         // Cronet rejects writes after the end of the request, which the bridge may already have sent itself, and an
-        // empty write before it, which has nothing to send anyway.
-        if (c.endQueued || c.reported || (data.isEmpty() && !endOfStream)) {
+        // empty write before it, which has nothing to send anyway. A GET or HEAD has no request side to write to.
+        if (!c.writable || c.endQueued || c.reported || (data.isEmpty() && !endOfStream)) {
             return
         }
         c.endQueued = endOfStream
@@ -380,6 +414,7 @@ class CronetBridge(
         if (engine.shuttingDown && engine.current.callIds.isEmpty() && engine.retired.isEmpty()) {
             engines.remove(engineId)
             shutdown(engineId, engine.current)
+            stopIfDone()
         }
     }
 

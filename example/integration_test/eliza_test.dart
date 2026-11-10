@@ -44,6 +44,7 @@ final class Harness {
     Duration? readIdleTimeout,
     Duration? deadlineStep,
     bool evictOnDeadline = false,
+    bool useHttpGet = false,
   }) async {
     late final Harness harness;
     final native = await NativeHttpClient.create(
@@ -62,6 +63,7 @@ final class Harness {
       baseUrl: baseUrl,
       codec: const ProtoCodec(),
       httpClient: native.httpClient,
+      useHttpGet: useHttpGet,
     );
     return harness = Harness._(native, ElizaServiceClient(transport));
   }
@@ -229,6 +231,22 @@ void main() {
     final res = await harness.eliza.say(SayRequest(sentence: 'hi'), onHeader: harness.recordHeaders);
     expect(res.sentence, 'say: hi');
     expect(harness.serverProtocols.single, startsWith('HTTP/'));
+  });
+
+  testCase('unary call over GET', (_) async {
+    // A request without a body. On Android, Cronet ends a GET's request side itself, and a write to it would abort
+    // the process.
+    final get = await Harness.create(serverUrl, http3Origins: {Uri.parse(serverUrl)}, useHttpGet: true);
+    addTearDown(get.native.close);
+    String? method;
+    final res = await get.eliza.say(
+      SayRequest(sentence: 'hi'),
+      onHeader: (headers) => method = headers.get('x-method')?.firstOrNull,
+    );
+    expect(res.sentence, 'say: hi');
+    expect(method, 'GET');
+    // The client carries on.
+    expect((await get.eliza.say(SayRequest(sentence: 'again'))).sentence, 'say: again');
   });
 
   testCase('unary error code comes through', (_) async {

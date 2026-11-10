@@ -12,6 +12,7 @@ class FakePlugin {
   FakePlugin() {
     _messenger.setMockMethodCallHandler(cronetMethodChannel, (call) async {
       calls.add(call);
+      await beforeReply?.call(call);
       if (refusing.contains(call.method)) {
         throw PlatformException(code: 'badArguments', message: '${call.method} refused');
       }
@@ -21,6 +22,9 @@ class FakePlugin {
   }
 
   final calls = <MethodCall>[];
+
+  /// Runs before the plugin answers a method call, for events that overtake the reply.
+  Future<void> Function(MethodCall call)? beforeReply;
 
   /// Methods the plugin answers with an error.
   final refusing = <String>{};
@@ -207,6 +211,17 @@ void main() {
     expect(cause.failure, NativeHttpFailure.notSent);
     expect(cause.requestNeverSent, isTrue);
     expect(cause.platformCode, -102);
+  });
+
+  test('a failure that overtakes the open reply fails the call, and is not reported as unhandled', () async {
+    plugin.beforeReply = (call) async {
+      if (call.method == 'open') {
+        await plugin.failed((call.arguments as Map)['callId'] as int, streamReady: false, internalErrorCode: -102);
+        await settle();
+      }
+    };
+    final cause = await failureCause(client.httpClient(request(null)));
+    expect(cause.failure, NativeHttpFailure.notSent);
   });
 
   test('a certificate error is untrusted', () async {
