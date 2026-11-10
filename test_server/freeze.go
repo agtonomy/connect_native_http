@@ -63,14 +63,17 @@ func (c *freezablePacketConn) SetWriteBuffer(bytes int) error {
 	return errors.New("the underlying conn can't set its send buffer")
 }
 
-// adminHandler lets tests on a device freeze the HTTP/3 path over plain HTTP:
+// adminHandler lets tests on a device freeze the HTTP/3 path, and see the health checks the server received, over
+// plain HTTP:
 //
 //	POST /freeze?for=10s   drop all UDP traffic for 10 s
 //	POST /unfreeze         stop dropping now
+//	GET /health-checks     every health check so far, as JSON (see healthLog)
 //
 // TCP is never frozen, so HTTP/2 calls are unaffected.
-func adminHandler(conn *freezablePacketConn) http.Handler {
+func adminHandler(conn *freezablePacketConn, health *healthLog) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health-checks", health.serveJSON)
 	mux.HandleFunc("POST /freeze", func(w http.ResponseWriter, r *http.Request) {
 		d, err := time.ParseDuration(r.URL.Query().Get("for"))
 		if err != nil || d <= 0 {

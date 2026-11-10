@@ -2,6 +2,7 @@ import 'package:connectrpc/connect.dart';
 import 'package:flutter/services.dart';
 
 import '../channel/channel_http_client.dart';
+import '../channel/keep_alive.dart';
 import '../native_http_config.dart';
 import '../native_http_exception.dart';
 import 'ns_url_error.dart';
@@ -40,6 +41,7 @@ final class UrlSessionHttpClient extends ChannelHttpClient {
   UrlSessionHttpClient._(int engineId, NativeHttpConfig config) : super(urlSessionBridge, engineId, config);
 
   static Future<UrlSessionHttpClient> create(NativeHttpConfig config) async {
+    validateKeepAlive(config.keepAlive);
     final engineId = await ChannelHttpClient.createEngine(urlSessionBridge, {
       'http3Origins': [
         for (final origin in config.http3Origins) [origin.host, origin.port],
