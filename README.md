@@ -52,6 +52,34 @@ No exception in the package should crash the app or leave a call hanging. Failur
 `NativeHttpClient.create` throws a `PlatformException` if the platform can't create a client, for example when Cronet's
 native library fails to load.
 
+### Read-idle timeout
+
+A call can fail once it has received nothing from the server for a set time. This is the only way either client
+notices a dead HTTP/2 connection (see "Dead connections"). Set it per call, or as a default for every call:
+
+```dart
+// One call. An interceptor can set it per procedure the same way.
+await eliza.say(request, headers: Headers()..setReadIdleTimeout(const Duration(seconds: 10)));
+
+// Every call that doesn't set its own. Duration.zero on a call turns the default off for that call.
+NativeHttpConfig(readIdleTimeout: const Duration(seconds: 30));
+```
+
+- **What it measures:** time since the call last received anything: headers, a body chunk or trailers. The timer starts
+  when the call does, so it also bounds the wait for the response headers. A unary call the server holds longer than
+  the timeout fails, and so does a stream that goes quiet for longer.
+- **iOS:** `URLRequest.timeoutInterval`. URLSession treats a request's 60 s as unset and uses the session's value
+  instead, so the bridge sends 60.001 s for a 60 s timeout.
+- **Android:** a timer in the bridge.
+- **The failure:** `unavailable`, with a `NativeHttpException` whose `platformCode` is `NSURLErrorTimedOut` (-1001) on
+  iOS or `net::ERR_TIMED_OUT` (-7) on Android. On Android a timeout before `onStreamReady` is `notSent`, as with any
+  other failure there.
+- **The connection:** a timeout is taken as a sign the connection is dead, and the connection is evicted. Neither stack
+  can close a single connection, so the client moves its new calls to a fresh `URLSession` or `CronetEngine`, which
+  dials its own connections. Calls already on the old one finish there, and it is released after the last one ends.
+- **The header:** the value travels in a `native-http-read-idle-timeout-ms` request header (`readIdleTimeoutHeader`),
+  which the client removes before sending. connect-dart's `CallOptions` carry nothing else per call.
+
 ## Server and infrastructure requirements
 
 The clients only reach HTTP/3, and only keep bidi working, if the server side meets these requirements. Each was
@@ -73,9 +101,11 @@ found or verified with the tests in this package.
   ([target group protocol version](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html)).
 - **Listener rules must route the Connect content types above to that target group.** A rule that matches only
   `application/grpc` sends Connect requests elsewhere.
-- **No client-side dead-connection detection.** Neither stack sends HTTP/2 pings the caller controls, and server
-  pings stop at any load balancer that terminates HTTP/2. Idle timeouts on the path must exceed a stream's longest
-  quiet period, or the stream must carry periodic messages. See "QUIC idle timeout vs HTTP/2 keepalive pings".
+- **No dead-connection detection apart from the read-idle timeout.** Neither stack sends HTTP/2 pings the caller
+  controls, and server pings stop at any load balancer that terminates HTTP/2. A read-idle timeout notices a dead
+  connection, but only if it is shorter than a stream's quiet periods. Idle timeouts on the path must exceed a
+  stream's longest quiet period, or the stream must carry periodic messages. See "QUIC idle timeout vs HTTP/2
+  keepalive pings".
 
 **The HTTP/3 endpoint**
 
@@ -111,7 +141,7 @@ found or verified with the tests in this package.
 | Certificates | System trust store | System trust store; QUIC only with certificates that chain to a public root |
 | Negotiated protocol | Not exposed (`NativeHttpResponseInfo.protocol` is `null`) | `h2`, `quic/1+spdy/3` (HTTP/3) or `http/1.1` |
 | QUIC idle timeout | No setting; the server's advertised value applies | `NativeHttpConfig.quicIdleTimeout`, in whole seconds |
-| Request idle timer | A task that receives nothing for a day fails; a quiet stream otherwise stays open | None |
+| Read-idle timeout | Per call, through `URLRequest.timeoutInterval`. Without one, a task that receives nothing for a day fails | Per call, through a timer in the bridge. None without one |
 | Redirects | Followed only for requests without a body; otherwise the 3xx response is returned, since a streamed body can't be resent | Not tested |
 
 ### Dead connections
@@ -136,9 +166,13 @@ The integration tests measure both:
 Clients may enforce a floor on the peer's value. quic-go's client raises anything under 5 s to 5 s
 (`protocol.MinRemoteIdleTimeout`), so measure any other client before relying on a short server value.
 
-This does nothing on the **HTTP/2 fallback** used where UDP is blocked. Neither stack exposes HTTP/2 pings, so a TCP
-connection that dies without the interface going down goes unnoticed until a call's deadline or an
-application-level heartbeat.
+None of this works on the **HTTP/2 fallback** used where UDP is blocked. Neither stack exposes HTTP/2 pings, so a TCP
+connection that dies without the interface going down goes unnoticed until a call's deadline, an application-level
+heartbeat, or a read-idle timeout. The integration tests check both sides:
+
+- Without a read-idle timeout, a frozen HTTP/2 connection draws no error for 3 s, and a new call on the same client
+  waits on it until its deadline.
+- With one, the call fails within the timeout, and the client's next call goes out on a new connection.
 
 ### QUIC idle timeout vs HTTP/2 keepalive pings
 
@@ -151,7 +185,7 @@ not over HTTP/2.
 | Who sets it | Both advertise a value; the connection uses the smaller (RFC 9000 §10.1) | Each side sets its own pings |
 | Can a server setting make the client notice? | Yes. A short server value becomes the client's timeout, and the server's pings stop arriving once the path dies. | No. A server that detects a dead connection can't tell the client, because nothing gets through. |
 | Through a load balancer | NLB QUIC passthrough is end to end, so the client sees the server's pings | An ALB ends HTTP/2 on each side, so the server's pings stop at the ALB. AWS doesn't document the ALB pinging clients, and nothing here relies on it. |
-| Client control here | Android: `quicIdleTimeout`. iOS: none. | None. Neither URLSession nor Cronet exposes HTTP/2 ping settings. |
+| Client control here | Android: `quicIdleTimeout`. iOS: none. Both: a read-idle timeout per call. | No pings: neither URLSession nor Cronet exposes HTTP/2 ping settings. Both: a read-idle timeout per call. |
 | What a client that sends its own pings gets, for comparison | — | `package:http2` with 3 s pings and a 3 s timeout notices in about 6 s |
 
 So for servers:
@@ -161,8 +195,8 @@ So for servers:
   - Too long an idle timeout delays detection.
   - Too few pings closes quiet connections that are healthy.
 - **HTTP/2:** server pings, such as `http.HTTP2Config.SendPingTimeout` in Go, only clean up the server's side.
-  - On the client, a silently dead connection lasts until a call deadline, an application-level heartbeat, or TCP's
-    own retransmission timeout, which takes minutes.
+  - On the client, a silently dead connection lasts until a call deadline, a read-idle timeout, an
+    application-level heartbeat, or TCP's own retransmission timeout, which takes minutes.
   - Every idle timeout on the path, such as a load balancer's, must exceed the longest quiet period of a stream, or
     the stream must carry periodic messages.
 
@@ -197,9 +231,14 @@ Neither platform finishes a stream on its own while the client still has its req
 - **`test_server/`:** a Go server for `connectrpc.eliza.v1.ElizaService` over HTTP/2 and HTTP/3, scripted for tests
   (see `eliza.go`).
   - `-max-idle` and `-keepalive` set its QUIC idle timeout and ping interval.
-  - `-admin-addr` serves `POST /freeze?for=10s` and `POST /unfreeze`, which drop all its UDP traffic so a test can
-    simulate a dead HTTP/3 path.
-  - Its own tests (`go test ./...`) check it over HTTP/3, including the idle timeout, pings and freezing.
+  - `-admin-addr` serves an endpoint that simulates dead paths:
+    - `POST /freeze?for=10s` drops all its UDP traffic, so every HTTP/3 connection.
+    - `POST /freeze?for=10s&path=tcp` black-holes the TCP connections open at that moment, so the HTTP/2 connections
+      clients already have. It drops what they send and what the server writes, then closes them. Connections opened
+      later work, so a client that dials again gets through.
+    - `POST /unfreeze` ends both.
+  - Its own tests (`go test ./...`) check it over HTTP/3, including the idle timeout, pings and freezing, and check
+    the TCP freeze over HTTP/2.
   - It creates a CA in `test_server/certs/` on first start and reuses it, so a device only has to trust it once.
   - With `QLOGDIR` set, it writes a qlog trace of each QUIC connection there, which shows the server's side of a
     handshake.
@@ -225,12 +264,20 @@ Neither platform finishes a stream on its own while the client still has its req
 
   The script starts the server with a 3 s idle timeout and 1 s pings. Over HTTP/3 (iOS) the tests also check two
   things: a quiet stream outlives the idle timeout, and a frozen path fails an open stream within it.
+
+  The read-idle timeout is tested over HTTP/2 on both platforms. On iOS each of these cases freezes the server's UDP
+  first, so URLSession falls back to TCP as it would where UDP is blocked. The cases check four things:
+  - A quiet stream fails at its timeout.
+  - A stream that keeps receiving outlives its timeout.
+  - Without a timeout, a frozen connection goes unnoticed. This is the control.
+  - With one, the call fails and the client's next call works, which it can only do on a new connection.
 - **Native bridge tests:** the same script runs them after the Dart tests, against the same server. Each platform's
   bridge (`URLSessionBridge`, `CronetBridge`) has no Flutter dependency, and the tests call it directly, for behavior
   Dart can't reach:
   - **iOS (`ios/connect_native_http/Tests`, XCTest):** a write stuck on a full buffer returns once the call is
     canceled or its connection fails; a redirect of a request with a body is returned, not followed; shutting a
-    session down lets its calls finish and refuses new ones. The script runs them on the simulator. For a quick loop
+    session down lets its calls finish and refuses new ones; a read-idle timeout fails a quiet call with
+    `NSURLErrorTimedOut`, and the engine's next call works. The script runs them on the simulator. For a quick loop
     on the Mac, against a running test server:
 
     ```bash
@@ -240,7 +287,9 @@ Neither platform finishes a stream on its own while the client still has its req
 
   - **Android (`android/src/androidTest`, instrumented):** writes sent before Cronet is ready go out once it is; a
     write after the server finished the call is dropped instead of crashing; shutting an engine down lets its calls
-    finish and refuses new ones; a header Cronet rejects fails its call as never sent; an empty write is skipped.
+    finish and refuses new ones; a header Cronet rejects fails its call as never sent; an empty write is skipped; a
+    read-idle timeout fails a quiet call with -7, once, and the engine's next call works; data arriving resets the
+    timer.
   - Both platforms' suites also check that malformed method calls get an error reply and leave the bridge working.
 - **`example/integration_test/public_server_test.dart`:** HTTP/3 on Android against a server with a public
   certificate. It also checks that `quicIdleTimeout` ends a quiet connection, against a control without it. It is

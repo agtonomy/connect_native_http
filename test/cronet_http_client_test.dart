@@ -64,10 +64,12 @@ class FakePlugin {
 /// Lets queued microtasks and platform-channel replies run.
 Future<void> settle() => Future<void>.delayed(Duration.zero);
 
-HttpRequest request(Stream<Uint8List>? body, {AbortSignal? signal}) => HttpRequest(
+HttpRequest request(Stream<Uint8List>? body, {AbortSignal? signal, Headers? headers}) => HttpRequest(
   'https://example.test/svc/Method',
   'POST',
-  Headers()..add('content-type', 'application/proto'),
+  Headers()
+    ..add('content-type', 'application/proto')
+    ..addAll(headers ?? Headers()),
   body,
   signal,
 );
@@ -300,6 +302,75 @@ void main() {
 
     // Cronet's own success arrives once both sides are closed, and changes nothing.
     await plugin.emit({'callId': id, 'type': 'done'});
+  });
+
+  group('read-idle timeout', () {
+    Future<Map<Object?, Object?>> openArgs(NativeHttpClient client, {Headers? headers}) async {
+      unawaited(client.httpClient(request(null, headers: headers)).then((_) {}, onError: (_) {}));
+      await settle();
+      return plugin.callsTo('open').last.arguments as Map;
+    }
+
+    test('is off unless configured', () async {
+      expect((await openArgs(client))['readIdleTimeoutMs'], isNull);
+    });
+
+    test("is the client's default for calls that don't set one", () async {
+      final configured = await CronetHttpClient.create(const NativeHttpConfig(readIdleTimeout: Duration(seconds: 3)));
+      expect((await openArgs(configured))['readIdleTimeoutMs'], 3000);
+    });
+
+    test("a call's own replaces the default, and its header doesn't reach the server", () async {
+      final configured = await CronetHttpClient.create(const NativeHttpConfig(readIdleTimeout: Duration(seconds: 3)));
+      final args = await openArgs(
+        configured,
+        headers: Headers()..setReadIdleTimeout(const Duration(milliseconds: 1500)),
+      );
+      expect(args['readIdleTimeoutMs'], 1500);
+      expect(args['headers'], [
+        ['content-type', 'application/proto'],
+      ]);
+    });
+
+    test('zero turns the default off for one call', () async {
+      final configured = await CronetHttpClient.create(const NativeHttpConfig(readIdleTimeout: Duration(seconds: 3)));
+      final args = await openArgs(configured, headers: Headers()..setReadIdleTimeout(Duration.zero));
+      expect(args['readIdleTimeoutMs'], isNull);
+    });
+
+    test('rounds up to whole milliseconds', () {
+      final headers = Headers()..setReadIdleTimeout(const Duration(microseconds: 1));
+      expect(headers[readIdleTimeoutHeader], '1');
+    });
+
+    test('a malformed header fails the call before it opens', () async {
+      for (final value in ['-1', '1.5', '0x10', '+5', 'soon']) {
+        final headers = Headers()..[readIdleTimeoutHeader] = value;
+        await expectLater(
+          client.httpClient(request(null, headers: headers)),
+          throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.internal)),
+          reason: value,
+        );
+      }
+      expect(plugin.callsTo('open'), isEmpty);
+    });
+
+    test('a negative timeout is refused', () async {
+      expect(() => Headers().setReadIdleTimeout(const Duration(seconds: -1)), throwsArgumentError);
+      await expectLater(
+        CronetHttpClient.create(const NativeHttpConfig(readIdleTimeout: Duration(seconds: -1))),
+        throwsArgumentError,
+      );
+    });
+
+    test('a timeout fails the call as unavailable, with the platform code', () async {
+      final response = client.httpClient(request(null));
+      await settle();
+      await plugin.failed(plugin.lastCallId, streamReady: true, internalErrorCode: -7);
+      final cause = await failureCause(response);
+      expect(cause.platformCode, -7);
+      expect(cause.failure, NativeHttpFailure.other);
+    });
   });
 
   test('close shuts the engine down', () async {

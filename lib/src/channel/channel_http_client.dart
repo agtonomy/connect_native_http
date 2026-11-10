@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../native_http_client.dart';
 import '../native_http_config.dart';
 import '../native_http_exception.dart';
+import '../read_idle_timeout.dart';
 import 'connect_end_stream.dart';
 
 /// A platform plugin that speaks this file's channel protocol: `createEngine`, `shutdownEngine`, `open`, `write`,
@@ -236,7 +237,15 @@ base class ChannelHttpClient implements NativeHttpClient {
   ChannelHttpClient(this._bridge, this._engineId, this._config);
 
   /// Starts the bridge's event routing and creates an engine with [arguments], returning its id.
-  static Future<int> createEngine(PlatformBridge bridge, Map<String, Object?> arguments) async {
+  static Future<int> createEngine(
+    PlatformBridge bridge,
+    NativeHttpConfig config,
+    Map<String, Object?> arguments,
+  ) async {
+    final readIdle = config.readIdleTimeout;
+    if (readIdle != null && readIdle.isNegative) {
+      throw ArgumentError.value(readIdle, 'readIdleTimeout', 'must not be negative');
+    }
     _Dispatcher.of(bridge);
     return (await bridge.methods.invokeMethod<int>('createEngine', arguments))!;
   }
@@ -251,6 +260,12 @@ base class ChannelHttpClient implements NativeHttpClient {
   Future<HttpResponse> _send(HttpRequest req) async {
     final dispatcher = _Dispatcher.of(_bridge);
     final methods = _bridge.methods;
+    final int? readIdleMs;
+    try {
+      readIdleMs = readIdleTimeoutMs(req.header, _config.readIdleTimeout);
+    } on FormatException catch (error) {
+      throw ConnectException(Code.internal, '${_bridge.name}: ${error.message}: ${error.source}', cause: error);
+    }
     final call = _Call(Uri.parse(req.url));
     final id = dispatcher.register(call, _config.onResponse);
     call.body.onCancel = () {
@@ -271,9 +286,11 @@ base class ChannelHttpClient implements NativeHttpClient {
         'url': req.url,
         'method': req.method,
         'headers': [
-          for (final (:name, :value) in req.header.entries) [name, value],
+          for (final (:name, :value) in req.header.entries)
+            if (name != readIdleTimeoutHeader) [name, value],
         ],
         'hasBody': req.body != null,
+        'readIdleTimeoutMs': readIdleMs,
       });
     } catch (error) {
       // The plugin refused the call, or isn't there (a background isolate, say): nothing was sent.

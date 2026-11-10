@@ -89,11 +89,46 @@ final class URLSessionBridgeTests: XCTestCase {
     XCTAssertEqual(outcome(2)?["domain"] as? String, "ConnectNativeHttp")
   }
 
+  func testReadIdleTimeoutFailsAQuietCallAndTheEngineCarriesOn() async throws {
+    let engine = try await createEngine()
+    try await open(
+      engine, callId: 1, path: Self.converse, contentType: "application/connect+proto", readIdleTimeoutMs: 500)
+    try await waitUntil("the greeting arrived") { self.received(1).contains("hello") }
+    let start = Date()
+    try await waitUntil("the call timed out") { self.outcome(1) != nil }
+    let elapsed = Date().timeIntervalSince(start)
+    XCTAssertEqual(outcome(1)?["type"] as? String, "failed", "\(String(describing: outcome(1)))")
+    XCTAssertEqual(outcome(1)?["code"] as? Int, NSURLErrorTimedOut)
+    XCTAssertLessThan(elapsed, 2, "a 500 ms read-idle timeout took \(elapsed) s")
+
+    // New calls go to a fresh URLSession.
+    try await open(engine, callId: 2, path: Self.say, contentType: "application/proto")
+    try await write(2, sentence("after"))
+    try await invoke("end", ["callId": 2])
+    try await waitUntil("the next call ended") { self.outcome(2) != nil }
+    XCTAssertEqual(outcome(2)?["type"] as? String, "done", "\(String(describing: outcome(2)))")
+    XCTAssertTrue(received(2).contains("say: after"))
+  }
+
+  func testRequestTimeoutIntervalAvoidsTheValueURLSessionIgnores() {
+    XCTAssertNil(URLSessionBridge.requestTimeoutInterval(readIdleTimeoutMs: nil))
+    XCTAssertEqual(URLSessionBridge.requestTimeoutInterval(readIdleTimeoutMs: 1500), 1.5)
+    XCTAssertEqual(URLSessionBridge.requestTimeoutInterval(readIdleTimeoutMs: 60_000), 60.001)
+  }
+
   func testMalformedArgumentsAreRefusedInsteadOfCrashing() async throws {
     let malformed: [(String, [String: Any])] = [
       ("open", [:]),
       ("open", ["engineId": "1", "callId": 1, "url": serverURL, "method": "POST", "headers": [[String]](), "hasBody": true]),
       ("open", ["engineId": 1, "callId": 1, "url": serverURL, "method": "POST", "headers": [["one"]], "hasBody": true]),
+      ("open", [
+        "engineId": 1, "callId": 1, "url": serverURL, "method": "POST", "headers": [[String]](), "hasBody": true,
+        "readIdleTimeoutMs": "soon",
+      ]),
+      ("open", [
+        "engineId": 1, "callId": 1, "url": serverURL, "method": "POST", "headers": [[String]](), "hasBody": true,
+        "readIdleTimeoutMs": 0,
+      ]),
       ("write", ["callId": 1, "data": "not bytes"]),
       ("end", ["callId": "1"]),
       ("cancel", [:]),
@@ -144,11 +179,15 @@ final class URLSessionBridgeTests: XCTestCase {
     return try await invoke("createEngine", ["http3Origins": [origin]]) as! Int
   }
 
-  private func open(_ engine: Int, callId: Int, path: String, contentType: String) async throws {
-    try await invoke("open", [
+  private func open(
+    _ engine: Int, callId: Int, path: String, contentType: String, readIdleTimeoutMs: Int? = nil
+  ) async throws {
+    var arguments: [String: Any] = [
       "engineId": engine, "callId": callId, "url": serverURL + path, "method": "POST",
       "headers": [["content-type", contentType], ["connect-protocol-version", "1"]], "hasBody": true,
-    ])
+    ]
+    arguments["readIdleTimeoutMs"] = readIdleTimeoutMs
+    try await invoke("open", arguments)
   }
 
   private func write(_ callId: Int, _ data: Data) async throws {

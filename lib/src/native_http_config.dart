@@ -12,7 +12,7 @@ final class NativeHttpResponseInfo {
 /// Configuration shared by both platform clients. Server certificates are checked against the platform's trust
 /// store.
 final class NativeHttpConfig {
-  const NativeHttpConfig({this.http3Origins = const {}, this.quicIdleTimeout, this.onResponse});
+  const NativeHttpConfig({this.http3Origins = const {}, this.quicIdleTimeout, this.readIdleTimeout, this.onResponse});
 
   /// `https://host:port` origins to try HTTP/3 with from the first request, before an `Alt-Svc` response header has
   /// advertised it. Both platforms fall back to HTTP/2 over TCP on their own when QUIC fails.
@@ -28,6 +28,22 @@ final class NativeHttpConfig {
   ///
   /// Android only. URLSession exposes no QUIC settings, so on iOS only the server's advertised idle timeout applies.
   final Duration? quicIdleTimeout;
+
+  /// The read-idle timeout of calls that don't set their own with `Headers.setReadIdleTimeout`: a call fails once it
+  /// has received nothing from the server for this long. `null` or [Duration.zero] means none. Both platforms apply it
+  /// per call, so it also works on the HTTP/2 fallback, where nothing else notices a dead connection.
+  ///
+  /// - **What resets it:** anything the call receives. It runs from when the call starts, so it also bounds the wait
+  ///   for the response headers, and a unary call the server holds longer than this fails. A server stream that may go
+  ///   quiet needs a longer timeout, or periodic messages.
+  /// - **iOS:** `URLRequest.timeoutInterval`. URLSession fails the task with `NSURLErrorTimedOut` (-1001).
+  /// - **Android:** a timer in the bridge, which fails the call with `net::ERR_TIMED_OUT` (-7).
+  /// - **The failure:** a `ConnectException` with code `unavailable`, whose cause is a [NativeHttpException] with
+  ///   that `platformCode`.
+  /// - **The connection:** a call that timed out is taken as a sign its connection is dead. The client moves new calls
+  ///   to a fresh `URLSession` or Cronet engine, so they dial a new connection, and lets the calls already on the old
+  ///   one finish there.
+  final Duration? readIdleTimeout;
 
   /// Called with each response's headers, before its body is read. An exception it throws goes to
   /// `FlutterError.onError`, and the call goes on.

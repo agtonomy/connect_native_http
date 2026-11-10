@@ -38,10 +38,14 @@ const introduceInterval = Duration(milliseconds: 100);
 final class Harness {
   Harness._(this.native, this.eliza);
 
-  static Future<Harness> create(String baseUrl, {Set<Uri> http3Origins = const {}}) async {
+  static Future<Harness> create(String baseUrl, {Set<Uri> http3Origins = const {}, Duration? readIdleTimeout}) async {
     late final Harness harness;
     final native = await NativeHttpClient.create(
-      NativeHttpConfig(http3Origins: http3Origins, onResponse: (info) => harness.platformProtocols.add(info.protocol)),
+      NativeHttpConfig(
+        http3Origins: http3Origins,
+        readIdleTimeout: readIdleTimeout,
+        onResponse: (info) => harness.platformProtocols.add(info.protocol),
+      ),
     );
     if (native == null) {
       throw StateError('no native client on this platform');
@@ -82,9 +86,14 @@ Future<void> admin(String path) async {
 }
 
 /// Opens Converse and reads the server's greeting. Nothing flows afterwards until the caller sends.
-Future<(StreamController<ConverseRequest>, StreamIterator<ConverseResponse>)> openQuietConverse(Harness harness) async {
+Future<(StreamController<ConverseRequest>, StreamIterator<ConverseResponse>)> openQuietConverse(
+  Harness harness, {
+  Headers? headers,
+}) async {
   final requests = StreamController<ConverseRequest>();
-  final responses = StreamIterator(harness.eliza.converse(requests.stream, onHeader: harness.recordHeaders));
+  final responses = StreamIterator(
+    harness.eliza.converse(requests.stream, headers: headers, onHeader: harness.recordHeaders),
+  );
   expect(await responses.moveNext(), isTrue);
   expect(responses.current.sentence, 'hello');
   return (requests, responses);
@@ -118,6 +127,25 @@ Future<Harness> harnessNegotiating(String protocol) async {
     }
   }
 }
+
+/// A client on HTTP/2, with the server's UDP frozen for the rest of the case so that QUIC can't connect: URLSession
+/// then falls back to TCP, as on a network that blocks UDP. Android is on HTTP/2 with this server anyway.
+Future<Harness> harnessOverHttp2({Duration? readIdleTimeout}) async {
+  addTearDown(() => admin('/unfreeze'));
+  await admin('/freeze?for=60s');
+  final harness = await Harness.create(serverUrl, readIdleTimeout: readIdleTimeout);
+  addTearDown(harness.native.close);
+  await harness.eliza.say(
+    SayRequest(sentence: 'which protocol'),
+    signal: TimeoutSignal(const Duration(seconds: 8)),
+    onHeader: harness.recordHeaders,
+  );
+  expect(harness.serverProtocols.last, 'HTTP/2.0');
+  return harness;
+}
+
+/// The platform code of a read-idle timeout: `NSURLErrorTimedOut` on iOS, `net::ERR_TIMED_OUT` from the Cronet bridge.
+final readIdleTimeoutCode = io.Platform.isIOS ? -1001 : -7;
 
 Future<NativeHttpException> nativeCause(Future<Object?> call) async {
   try {
@@ -315,6 +343,105 @@ void main() {
     expect(res.sentence, 'say: sleep:${hold.inMilliseconds}');
     expect(h3.serverProtocols.last, 'HTTP/3.0');
   }, timeout: http3CaseTimeout);
+
+  // Over HTTP/2 neither platform notices a dead connection (no pings), so a read-idle timeout is what does.
+  bool skipUnlessAdmin() {
+    if (adminUrl.isEmpty) {
+      markTestSkipped('needs ADMIN_URL');
+      return true;
+    }
+    return false;
+  }
+
+  // Up to 8 s for the first call over HTTP/2 on top of the case itself.
+  const http2CaseTimeout = Duration(seconds: 25);
+
+  testCase('a read-idle timeout ends a quiet HTTP/2 stream', (_) async {
+    if (skipUnlessAdmin()) {
+      return;
+    }
+    final h2 = await harnessOverHttp2();
+    const timeout = Duration(seconds: 1);
+    final (requests, responses) = await openQuietConverse(h2, headers: Headers()..setReadIdleTimeout(timeout));
+    expect(h2.serverProtocols.last, 'HTTP/2.0');
+
+    // Timed from the greeting, the last thing the stream received.
+    final stopwatch = Stopwatch()..start();
+    final cause = await nativeCause(responses.moveNext());
+    expect(cause.platformCode, readIdleTimeoutCode, reason: '$cause');
+    expect(cause.failure, NativeHttpFailure.other, reason: '$cause');
+    expect(stopwatch.elapsed, greaterThan(timeout * 0.5));
+    expect(stopwatch.elapsed, lessThan(timeout + const Duration(seconds: 2)));
+    await requests.close();
+  }, timeout: http2CaseTimeout);
+
+  testCase('an HTTP/2 stream that keeps receiving outlives its read-idle timeout', (_) async {
+    if (skipUnlessAdmin()) {
+      return;
+    }
+    final h2 = await harnessOverHttp2();
+    const timeout = Duration(seconds: 1);
+    final (requests, responses) = await openQuietConverse(h2, headers: Headers()..setReadIdleTimeout(timeout));
+    // Three times the timeout in all, but never more than 0.6 of it between replies.
+    for (var i = 0; i < 5; i++) {
+      await Future<void>.delayed(timeout * 0.6);
+      requests.add(ConverseRequest(sentence: 'ping $i'));
+      expect(await responses.moveNext(), isTrue);
+      expect(responses.current.sentence, 'echo: ping $i');
+    }
+    requests.add(ConverseRequest(sentence: 'bye'));
+    expect(await responses.moveNext(), isTrue);
+    expect(await responses.moveNext(), isFalse);
+    await requests.close();
+  }, timeout: http2CaseTimeout);
+
+  testCase('without a read-idle timeout, a dead HTTP/2 connection goes unnoticed', (_) async {
+    // The control for the next case: what the read-idle timeout is for.
+    if (skipUnlessAdmin()) {
+      return;
+    }
+    final h2 = await harnessOverHttp2();
+    final (requests, responses) = await openQuietConverse(h2);
+    await admin('/freeze?for=60s&path=tcp');
+
+    requests.add(ConverseRequest(sentence: 'anyone?'));
+    final reply = responses.moveNext();
+    await expectLater(reply.timeout(const Duration(seconds: 3)), throwsA(isA<TimeoutException>()));
+    // A new call goes to the same pooled connection, and waits until its deadline.
+    await expectLater(
+      h2.eliza.say(SayRequest(sentence: 'hi'), signal: TimeoutSignal(const Duration(seconds: 2))),
+      throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
+    );
+    unawaited(reply.then((_) {}, onError: (_) {}));
+    await requests.close();
+  }, timeout: http2CaseTimeout);
+
+  testCase('a read-idle timeout notices a dead HTTP/2 connection, and the next call dials a new one', (_) async {
+    if (skipUnlessAdmin()) {
+      return;
+    }
+    // The client-wide default this time, rather than per call.
+    const timeout = Duration(seconds: 2);
+    final h2 = await harnessOverHttp2(readIdleTimeout: timeout);
+    final (requests, responses) = await openQuietConverse(h2);
+    await admin('/freeze?for=60s&path=tcp');
+
+    requests.add(ConverseRequest(sentence: 'anyone?'));
+    final stopwatch = Stopwatch()..start();
+    final cause = await nativeCause(responses.moveNext());
+    expect(cause.platformCode, readIdleTimeoutCode, reason: '$cause');
+    expect(stopwatch.elapsed, lessThan(timeout + const Duration(seconds: 2)));
+    await requests.close();
+
+    // The frozen connection is still open, so this only works on a new one.
+    final res = await h2.eliza.say(
+      SayRequest(sentence: 'after'),
+      signal: TimeoutSignal(const Duration(seconds: 8)),
+      onHeader: h2.recordHeaders,
+    );
+    expect(res.sentence, 'say: after');
+    expect(h2.serverProtocols.last, 'HTTP/2.0');
+  }, timeout: http2CaseTimeout);
 
   testCase('a dead HTTP/3 path fails an open stream', (_) async {
     if (skipUnlessHttp3()) {

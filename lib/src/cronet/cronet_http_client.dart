@@ -36,7 +36,7 @@ final class CronetHttpClient extends ChannelHttpClient {
     if (idle != null && idle < const Duration(seconds: 1)) {
       throw ArgumentError.value(idle, 'quicIdleTimeout', 'Cronet takes whole seconds; use at least 1 s');
     }
-    final engineId = await ChannelHttpClient.createEngine(cronetBridge, {
+    final engineId = await ChannelHttpClient.createEngine(cronetBridge, config, {
       'quicHints': [
         for (final origin in config.http3Origins) [origin.host, origin.port],
       ],

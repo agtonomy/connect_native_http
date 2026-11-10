@@ -33,7 +33,8 @@ public final class URLSessionBridge {
   private var nextSessionId = 1
 
   private final class Session {
-    let urlSession: URLSession
+    // Replaced after a call times out, so new calls dial a fresh connection; see `evictConnection`.
+    var urlSession: URLSession
     let http3Origins: Set<String>
 
     init(urlSession: URLSession, http3Origins: Set<String>) {
@@ -44,6 +45,9 @@ public final class URLSessionBridge {
 
   private final class Call {
     let callId: Int
+    var engineId = 0
+    // The URLSession the call's task runs in.
+    var urlSession: URLSession?
     var task: URLSessionTask!
     var input: InputStream?
     var output: OutputStream?
@@ -90,17 +94,9 @@ public final class URLSessionBridge {
         return "\(origin[0]):\(origin[1])"
       }
       queue.async {
-        let configuration = URLSessionConfiguration.ephemeral
-        // URLSession fails a task that receives nothing for this long. Its default of 60 s would end a quiet stream
-        // or a long-running unary call; callers bound calls with deadlines instead.
-        configuration.timeoutIntervalForRequest = 24 * 60 * 60
-        // Only a bridge with its own roots implements the trust challenge. With the system's roots there is nothing
-        // for the delegate to decide, so certificate checks are left entirely to the network stack.
-        let delegate = self.trustedRoots.isEmpty ? Delegate(bridge: self) : TrustingDelegate(bridge: self)
-        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: self.delegateQueue)
         let id = self.nextSessionId
         self.nextSessionId += 1
-        self.sessions[id] = Session(urlSession: session, http3Origins: Set(origins))
+        self.sessions[id] = Session(urlSession: self.makeURLSession(), http3Origins: Set(origins))
         reply(.success(id))
       }
     case "shutdownEngine":
@@ -117,7 +113,13 @@ public final class URLSessionBridge {
       let headers: [[String]] = try arg(args, "headers")
       guard headers.allSatisfy({ $0.count == 2 }) else { throw BadArgument(name: "headers") }
       let hasBody: Bool = try arg(args, "hasBody")
-      queue.async { self.open(engineId, callId, url, method, headers, hasBody) }
+      // Absent or null for none.
+      var readIdleTimeoutMs: Int?
+      if let value = args["readIdleTimeoutMs"], !(value is NSNull) {
+        guard let ms = value as? Int, ms > 0 else { throw BadArgument(name: "readIdleTimeoutMs") }
+        readIdleTimeoutMs = ms
+      }
+      queue.async { self.open(engineId, callId, url, method, headers, hasBody, readIdleTimeoutMs) }
       reply(.success(nil))
     case "write":
       let callId: Int = try arg(args, "callId")
@@ -153,8 +155,29 @@ public final class URLSessionBridge {
     ["callId": callId, "type": "failed", "domain": domain, "code": code, "message": message]
   }
 
+  private func makeURLSession() -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    // URLSession fails a task that receives nothing for this long. Its default of 60 s would end a quiet stream or a
+    // long-running unary call; callers bound calls with deadlines, or set their own read-idle timeout per request.
+    configuration.timeoutIntervalForRequest = Self.sessionIdleTimeout
+    // Only a bridge with its own roots implements the trust challenge. With the system's roots there is nothing for
+    // the delegate to decide, so certificate checks are left entirely to the network stack.
+    let delegate = trustedRoots.isEmpty ? Delegate(bridge: self) : TrustingDelegate(bridge: self)
+    return URLSession(configuration: configuration, delegate: delegate, delegateQueue: delegateQueue)
+  }
+
+  /// The `URLRequest.timeoutInterval` for a read-idle timeout of `ms` milliseconds, or nil for the session's.
+  static func requestTimeoutInterval(readIdleTimeoutMs ms: Int?) -> TimeInterval? {
+    guard let ms else { return nil }
+    let interval = TimeInterval(ms) / 1000
+    // URLSession takes a request's 60 s, URLRequest's default, to mean "not set" and applies the session's value
+    // instead, however the request got it. One millisecond more is still honored.
+    return interval == 60 ? 60.001 : interval
+  }
+
   private func open(
-    _ engineId: Int, _ callId: Int, _ url: String, _ method: String, _ headers: [[String]], _ hasBody: Bool
+    _ engineId: Int, _ callId: Int, _ url: String, _ method: String, _ headers: [[String]], _ hasBody: Bool,
+    _ readIdleTimeoutMs: Int?
   ) {
     guard let session = sessions[engineId], let target = URL(string: url) else {
       emit(failure(
@@ -169,8 +192,15 @@ public final class URLSessionBridge {
     }
     let port = target.port ?? (target.scheme == "http" ? 80 : 443)
     request.assumesHTTP3Capable = session.http3Origins.contains("\(target.host ?? ""):\(port)")
+    // The request's read-idle timeout: URLSession fails the task once it has received nothing for this long, with
+    // NSURLErrorTimedOut.
+    if let interval = Self.requestTimeoutInterval(readIdleTimeoutMs: readIdleTimeoutMs) {
+      request.timeoutInterval = interval
+    }
 
     let c = Call(callId: callId)
+    c.engineId = engineId
+    c.urlSession = session.urlSession
     if hasBody {
       var input: InputStream?
       var output: OutputStream?
@@ -248,7 +278,20 @@ public final class URLSessionBridge {
       emit(["callId": c.callId, "type": "canceled"])
       return
     }
+    if error.domain == NSURLErrorDomain && error.code == NSURLErrorTimedOut {
+      evictConnection(of: c)
+    }
     emit(failure(c.callId, domain: error.domain, code: error.code, message: error.localizedDescription))
+  }
+
+  // A call that timed out is taken as a sign its connection is dead. URLSession pools connections per session and has
+  // no call that closes one, so the engine's new calls go to a fresh URLSession, which dials its own connections. The
+  // old one finishes the tasks it still has, and is then released. Calls that time out together on the same dead
+  // connection replace it once.
+  private func evictConnection(of c: Call) {
+    guard let session = sessions[c.engineId], let old = c.urlSession, session.urlSession === old else { return }
+    session.urlSession = makeURLSession()
+    old.finishTasksAndInvalidate()
   }
 
   fileprivate func serverTrust(_ challenge: URLAuthenticationChallenge) -> (
@@ -267,6 +310,9 @@ public final class URLSessionBridge {
 
   // 64 KiB, the bound pair's buffer: how much request body may wait for URLSession to read it.
   private static let bodyBufferBytes = 64 * 1024
+
+  // A day: in effect no read-idle timeout, for requests that don't set one.
+  private static let sessionIdleTimeout: TimeInterval = 24 * 60 * 60
 }
 
 // URLSession keeps its delegate until the session is invalidated, so this holds the bridge weakly.
