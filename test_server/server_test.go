@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -168,7 +169,7 @@ func TestFrozenPathFailsOpenStreamWithinIdleTimeout(t *testing.T) {
 
 func TestAdminFreezeAndUnfreeze(t *testing.T) {
 	conn := &freezablePacketConn{}
-	handler := adminHandler(conn)
+	handler := adminHandler(conn, newFreezableListener(nil))
 	post := func(target string) int {
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, target, nil))
@@ -182,6 +183,96 @@ func TestAdminFreezeAndUnfreeze(t *testing.T) {
 	}
 	if code := post("/freeze?for=nonsense"); code != http.StatusBadRequest || conn.frozen() {
 		t.Fatalf("bad duration: status %d, frozen %t", code, conn.frozen())
+	}
+	if code := post("/freeze?for=1h&path=tcp"); code != http.StatusOK || conn.frozen() {
+		t.Fatalf("freeze tcp: status %d, udp frozen %t", code, conn.frozen())
+	}
+	if code := post("/freeze?for=1h&path=sctp"); code != http.StatusBadRequest {
+		t.Fatalf("unknown path: status %d", code)
+	}
+}
+
+// startHTTP2 serves the eliza handler over HTTP/2 on a free loopback TCP port, through a freezableListener, and
+// returns a function that makes a client with its own connections.
+func startHTTP2(t *testing.T) (func() elizav1connect.ElizaServiceClient, *freezableListener) {
+	t.Helper()
+	dir := t.TempDir()
+	cert, err := writeCertificates(dir, []string{"localhost", "127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	caDER, err := os.ReadFile(filepath.Join(dir, "ca.der"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := newFreezableListener(tcp)
+	server := &http.Server{Handler: protocolHeaders(newElizaMux(), ""), TLSConfig: newTLSConfig(cert)}
+	go func() { _ = server.ServeTLS(listener, "", "") }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	baseURL := "https://" + tcp.Addr().String()
+	newClient := func() elizav1connect.ElizaServiceClient {
+		transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}, ForceAttemptHTTP2: true}
+		t.Cleanup(transport.CloseIdleConnections)
+		client := connect.NewClient(connecthttp.NewTransport(&http.Client{Transport: transport}, baseURL))
+		return elizav1connect.NewElizaServiceClient(client)
+	}
+	return newClient, listener
+}
+
+func TestFrozenTCPConnectionGoesSilentAndNewConnectionsWork(t *testing.T) {
+	newClient, listener := startHTTP2(t)
+	stream := openQuietConverse(t, newClient())
+	if n := listener.Freeze(time.Minute); n != 1 {
+		t.Fatalf("froze %d connections, want 1", n)
+	}
+	t.Cleanup(func() { listener.Freeze(0) })
+
+	// Nothing fails on the frozen connection: the client's sentence and the server's echo both vanish.
+	received := make(chan error, 1)
+	go func() {
+		if err := stream.Send(&elizav1.ConverseRequest{Sentence: "anyone?"}); err != nil {
+			received <- err
+			return
+		}
+		res, err := stream.Receive()
+		if err == nil {
+			err = fmt.Errorf("received %q", res.GetSentence())
+		}
+		received <- err
+	}()
+	select {
+	case err := <-received:
+		t.Fatalf("the frozen connection answered: %v", err)
+	case <-time.After(time.Second):
+	}
+
+	// A connection dialed after the freeze works.
+	res, err := newClient().Say(timeoutContext(t), &elizav1.SayRequest{Sentence: "fresh"})
+	if err != nil || res.GetSentence() != "say: fresh" {
+		t.Fatalf("Say on a new connection: %v, %v", res, err)
+	}
+
+	// Unfreezing closes the frozen connection, which ends the stream.
+	listener.Freeze(0)
+	select {
+	case err := <-received:
+		if err == nil {
+			t.Fatal("the stream ended without an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream outlived its closed connection")
 	}
 }
 
@@ -378,6 +469,9 @@ func TestAltSvcOnlyOnTCPResponses(t *testing.T) {
 		handler.ServeHTTP(w, req)
 		if got := w.Header().Get("Alt-Svc"); got != tc.wantAltSvc {
 			t.Errorf("HTTP/%d: Alt-Svc = %q, want %q", tc.major, got, tc.wantAltSvc)
+		}
+		if got := w.Header().Get("X-Remote-Addr"); got != req.RemoteAddr {
+			t.Errorf("HTTP/%d: X-Remote-Addr = %q, want %q", tc.major, got, req.RemoteAddr)
 		}
 	}
 }

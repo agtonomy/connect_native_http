@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:connectrpc/connect.dart';
 import 'package:flutter/foundation.dart';
@@ -59,6 +60,9 @@ final class _Call {
 
   /// Set when the call's signal fired, so the outcome reports the signal's error rather than the cancellation.
   Object? abortError;
+
+  /// Time since the call last received anything from the server, or started.
+  final sinceReceived = Stopwatch()..start();
 
   void fail(Object error) {
     finished = true;
@@ -133,9 +137,16 @@ final class _Dispatcher {
 
   /// Asks the plugin to cancel call [id]; its `canceled` event then ends the call. Should the plugin fail to take the
   /// request, no event will come, so the call ends here instead.
-  Future<void> cancel(int id) async {
+  ///
+  /// With [evictConnection], the call hit its deadline (see [NativeHttpConfig.evictOnDeadline]). The plugin then moves
+  /// new calls off the call's connection, unless something from the call's origin has arrived since the call last
+  /// received anything.
+  Future<void> cancel(int id, {bool evictConnection = false}) async {
     try {
-      await bridge.methods.invokeMethod<void>('cancel', {'callId': id});
+      await bridge.methods.invokeMethod<void>('cancel', {
+        'callId': id,
+        if (evictConnection) 'evictConnection': true,
+      });
     } catch (error, stack) {
       final call = remove(id);
       call?.fail(call.abortError ?? ConnectException(Code.canceled, '${bridge.name}: cancel failed: $error'));
@@ -169,6 +180,9 @@ final class _Dispatcher {
   }
 
   void _onCallEvent(int id, _Call call, Map<String, Object?> e) {
+    if (const {'headers', 'data', 'trailers'}.contains(e['type'])) {
+      call.sinceReceived.reset();
+    }
     switch (e['type']) {
       case 'headers':
         final headers = bridge.responseHeaders([
@@ -231,12 +245,31 @@ final class _Dispatcher {
   }
 }
 
+/// The `connect-timeout-ms` to send for a call whose deadline is [ms] away: [step] less, or half of [ms] when that is
+/// less, so the server never gets zero. See [NativeHttpConfig.deadlineStep].
+int serverTimeoutMs(int ms, Duration step) => ms - math.min(step.inMilliseconds, ms ~/ 2);
+
+/// connect-dart's deadline header, which it sets from the call's signal.
+const _connectTimeoutHeader = 'connect-timeout-ms';
+
 /// A connect-dart [HttpClient] on one engine of a [PlatformBridge] plugin.
 base class ChannelHttpClient implements NativeHttpClient {
   ChannelHttpClient(this._bridge, this._engineId, this._config);
 
   /// Starts the bridge's event routing and creates an engine with [arguments], returning its id.
-  static Future<int> createEngine(PlatformBridge bridge, Map<String, Object?> arguments) async {
+  static Future<int> createEngine(
+    PlatformBridge bridge,
+    NativeHttpConfig config,
+    Map<String, Object?> arguments,
+  ) async {
+    final readIdle = config.readIdleTimeout;
+    if (readIdle != null && readIdle.isNegative) {
+      throw ArgumentError.value(readIdle, 'readIdleTimeout', 'must not be negative');
+    }
+    final step = config.deadlineStep;
+    if (step != null && step.isNegative) {
+      throw ArgumentError.value(step, 'deadlineStep', 'must not be negative');
+    }
     _Dispatcher.of(bridge);
     return (await bridge.methods.invokeMethod<int>('createEngine', arguments))!;
   }
@@ -245,13 +278,36 @@ base class ChannelHttpClient implements NativeHttpClient {
   final int _engineId;
   final NativeHttpConfig _config;
 
+  /// [NativeHttpConfig.deadlineStep], or `null` for none.
+  late final Duration? _deadlineStep = _config.deadlineStep == Duration.zero ? null : _config.deadlineStep;
+
+  /// [NativeHttpConfig.readIdleTimeout] in whole milliseconds, rounded up so a sub-millisecond timeout isn't none.
+  late final int? _readIdleTimeoutMs = switch (_config.readIdleTimeout) {
+    null || Duration.zero => null,
+    final timeout => (timeout.inMicroseconds / 1000).ceil(),
+  };
+
   @override
   HttpClient get httpClient => _send;
 
   Future<HttpResponse> _send(HttpRequest req) async {
     final dispatcher = _Dispatcher.of(_bridge);
     final methods = _bridge.methods;
+    final step = _deadlineStep;
     final call = _Call(Uri.parse(req.url));
+    // How much earlier than the client the server times the call out.
+    var serverLead = Duration.zero;
+    final headers = <List<String>>[];
+    for (final (:name, :value) in req.header.entries) {
+      final ms = step != null && name == _connectTimeoutHeader ? int.tryParse(value) : null;
+      if (ms != null && ms > 0) {
+        final serverMs = serverTimeoutMs(ms, step!);
+        serverLead = Duration(milliseconds: ms - serverMs);
+        headers.add([name, '$serverMs']);
+      } else {
+        headers.add([name, value]);
+      }
+    }
     final id = dispatcher.register(call, _config.onResponse);
     call.body.onCancel = () {
       if (!call.finished) {
@@ -259,10 +315,15 @@ base class ChannelHttpClient implements NativeHttpClient {
       }
     };
     req.signal?.future.then((error) {
-      if (!call.finished) {
-        call.abortError = error;
-        unawaited(dispatcher.cancel(id));
+      if (call.finished) {
+        return;
       }
+      call.abortError = error;
+      // A call that received something since the server's deadline was still hearing from the server, whatever the
+      // server made of the deadline, so its connection is alive.
+      final evict =
+          _config.evictOnDeadline && error.code == Code.deadlineExceeded && call.sinceReceived.elapsed >= serverLead;
+      unawaited(dispatcher.cancel(id, evictConnection: evict));
     });
     try {
       await methods.invokeMethod<void>('open', {
@@ -270,10 +331,9 @@ base class ChannelHttpClient implements NativeHttpClient {
         'callId': id,
         'url': req.url,
         'method': req.method,
-        'headers': [
-          for (final (:name, :value) in req.header.entries) [name, value],
-        ],
+        'headers': headers,
         'hasBody': req.body != null,
+        'readIdleTimeoutMs': _readIdleTimeoutMs,
       });
     } catch (error) {
       // The plugin refused the call, or isn't there (a background isolate, say): nothing was sent.

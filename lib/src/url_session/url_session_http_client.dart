@@ -40,7 +40,7 @@ final class UrlSessionHttpClient extends ChannelHttpClient {
   UrlSessionHttpClient._(int engineId, NativeHttpConfig config) : super(urlSessionBridge, engineId, config);
 
   static Future<UrlSessionHttpClient> create(NativeHttpConfig config) async {
-    final engineId = await ChannelHttpClient.createEngine(urlSessionBridge, {
+    final engineId = await ChannelHttpClient.createEngine(urlSessionBridge, config, {
       'http3Origins': [
         for (final origin in config.http3Origins) [origin.host, origin.port],
       ],

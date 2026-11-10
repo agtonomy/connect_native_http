@@ -8,7 +8,7 @@
 //
 // -max-idle and -keepalive set the server's QUIC idle timeout and ping interval. QUIC uses the smaller of the two
 // endpoints' idle timeouts, so -max-idle also bounds how long a client takes to notice a dead path. -admin-addr
-// serves a plain-HTTP endpoint that freezes the HTTP/3 path (see adminHandler).
+// serves a plain-HTTP endpoint that freezes the HTTP/3 path, or the open HTTP/2 connections (see adminHandler).
 package main
 
 import (
@@ -69,33 +69,39 @@ func main() {
 	handler := protocolHeaders(newElizaMux(), *altSvc)
 	tlsConfig := newTLSConfig(cert)
 	h2 := &http.Server{Addr: *addr, Handler: handler, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second}
+	tcp, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("http2: %v", err)
+	}
+	tcpConns := newFreezableListener(tcp)
 	go func() {
-		if err := h2.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := h2.ServeTLS(tcpConns, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http2: %v", err)
 		}
 	}()
 
 	var h3 *http3.Server
+	var udpConn *freezablePacketConn
 	if !*noH3 {
 		udp, err := net.ListenPacket("udp", *h3Addr)
 		if err != nil {
 			log.Fatalf("http3: %v", err)
 		}
-		conn := &freezablePacketConn{PacketConn: udp}
+		udpConn = &freezablePacketConn{PacketConn: udp}
 		h3 = newHTTP3Server(handler, tlsConfig, quicConfig(*maxIdle, *keepAlive))
 		go func() {
-			if err := h3.Serve(conn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := h3.Serve(udpConn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Fatalf("http3: %v", err)
 			}
 		}()
-		if *adminAddr != "" {
-			admin := &http.Server{Addr: *adminAddr, Handler: adminHandler(conn), ReadHeaderTimeout: 10 * time.Second}
-			go func() {
-				if err := admin.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-					log.Fatalf("admin: %v", err)
-				}
-			}()
-		}
+	}
+	if *adminAddr != "" {
+		admin := &http.Server{Addr: *adminAddr, Handler: adminHandler(udpConn, tcpConns), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := admin.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("admin: %v", err)
+			}
+		}()
 	}
 	log.Printf("listening: tcp %s, udp %s (h3 %t, max idle %s, keepalive %s), admin %q, Alt-Svc %q, CA in %s",
 		*addr, *h3Addr, !*noH3, *maxIdle, *keepAlive, *adminAddr, *altSvc, *certDir)
@@ -142,11 +148,13 @@ func newElizaMux() *http.ServeMux {
 }
 
 // protocolHeaders logs each request and reports the protocol it arrived on in X-Proto, which is how tests check
-// for HTTP/3 on clients that don't expose the negotiated protocol. HTTP/2 responses also advertise HTTP/3.
+// for HTTP/3 on clients that don't expose the negotiated protocol, and the client's address in X-Remote-Addr, which
+// tells a test whether two calls shared a connection. HTTP/2 responses also advertise HTTP/3.
 func protocolHeaders(next http.Handler, altSvc string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s %s from %s", r.Proto, r.Method, r.URL.Path, r.RemoteAddr)
 		w.Header().Set("X-Proto", r.Proto)
+		w.Header().Set("X-Remote-Addr", r.RemoteAddr)
 		if r.ProtoMajor < 3 && altSvc != "" {
 			w.Header().Set("Alt-Svc", altSvc)
 		}

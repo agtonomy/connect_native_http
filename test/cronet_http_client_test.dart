@@ -248,6 +248,109 @@ void main() {
     await expectLater(response, throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.canceled)));
   });
 
+  group('deadlines', () {
+    Future<Map<Object?, Object?>> cancelAfterDeadline(NativeHttpClient client) async {
+      final signal = TimeoutSignal(const Duration(milliseconds: 10));
+      final response = client.httpClient(request(StreamController<Uint8List>().stream, signal: signal));
+      await settle();
+      final id = plugin.lastCallId;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final cancel = plugin.callsTo('cancel').single.arguments as Map;
+      expect(cancel['callId'], id);
+      await plugin.emit({'callId': id, 'type': 'canceled'});
+      await expectLater(
+        response,
+        throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
+      );
+      return cancel;
+    }
+
+    Future<String?> sentTimeout(NativeHttpClient client, String timeout) async {
+      final headers = Headers()
+        ..add('content-type', 'application/proto')
+        ..add('connect-timeout-ms', timeout);
+      final req = HttpRequest('https://example.test/svc/Method', 'POST', headers, null, null);
+      unawaited(client.httpClient(req).then((_) {}, onError: (_) {}));
+      await settle();
+      final pairs = (plugin.callsTo('open').last.arguments as Map)['headers'] as List;
+      return pairs.cast<List<Object?>>().firstWhere((pair) => pair[0] == 'connect-timeout-ms')[1] as String?;
+    }
+
+    test('by default a deadline cancels the stream and leaves its connection alone', () async {
+      expect((await cancelAfterDeadline(client)).containsKey('evictConnection'), isFalse);
+    });
+
+    test("with evictOnDeadline, a deadline asks the plugin to leave the call's connection", () async {
+      final evicting = await CronetHttpClient.create(const NativeHttpConfig(evictOnDeadline: true));
+      expect((await cancelAfterDeadline(evicting))['evictConnection'], isTrue);
+    });
+
+    test('a call still receiving within the server\'s head start does not evict', () async {
+      final both = await CronetHttpClient.create(
+        const NativeHttpConfig(deadlineStep: Duration(seconds: 1), evictOnDeadline: true),
+      );
+      Future<Map<Object?, Object?>> cancelArgs({required bool receiveLate}) async {
+        plugin.calls.clear();
+        // 400 ms: the server gets 200 ms, half, so its head start is 200 ms.
+        final headers = Headers()
+          ..add('content-type', 'application/proto')
+          ..add('connect-timeout-ms', '400');
+        final req = HttpRequest(
+          'https://example.test/svc/Method',
+          'POST',
+          headers,
+          StreamController<Uint8List>().stream,
+          TimeoutSignal(const Duration(milliseconds: 400)),
+        );
+        final response = both.httpClient(req);
+        await settle();
+        final id = plugin.lastCallId;
+        if (receiveLate) {
+          await Future<void>.delayed(const Duration(milliseconds: 330));
+          await plugin.headers(id);
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        final cancel = plugin.callsTo('cancel').single.arguments as Map;
+        await plugin.emit({'callId': id, 'type': 'canceled'});
+        await response.then((r) => r.body.drain<void>()).catchError((_) {});
+        return cancel;
+      }
+
+      expect((await cancelArgs(receiveLate: false))['evictConnection'], isTrue);
+      expect((await cancelArgs(receiveLate: true)).containsKey('evictConnection'), isFalse);
+    });
+
+    test('a signal that is not a deadline leaves the connection alone', () async {
+      final evicting = await CronetHttpClient.create(const NativeHttpConfig(evictOnDeadline: true));
+      final signal = CancelableSignal();
+      unawaited(evicting.httpClient(request(null, signal: signal)).then((_) {}, onError: (_) {}));
+      await settle();
+      signal.cancel('stop');
+      await settle();
+      expect((plugin.callsTo('cancel').single.arguments as Map).containsKey('evictConnection'), isFalse);
+    });
+
+    test('by default the server gets the deadline as it is', () async {
+      expect(await sentTimeout(client, '5000'), '5000');
+    });
+
+    test("with deadlineStep, the server's deadline is a step shorter than the client's", () async {
+      final stepping = await CronetHttpClient.create(const NativeHttpConfig(deadlineStep: Duration(seconds: 1)));
+      expect(await sentTimeout(stepping, '5000'), '4000');
+      // Under two steps, half: the server never gets zero.
+      expect(await sentTimeout(stepping, '1500'), '750');
+      expect(await sentTimeout(stepping, '1'), '1');
+      expect(await sentTimeout(stepping, 'soon'), 'soon');
+    });
+
+    test('a negative step is refused', () async {
+      await expectLater(
+        CronetHttpClient.create(const NativeHttpConfig(deadlineStep: Duration(seconds: -1))),
+        throwsArgumentError,
+      );
+    });
+  });
+
   test('cancelling the response body cancels the native stream', () async {
     final responseFuture = client.httpClient(request(null));
     await settle();
@@ -300,6 +403,52 @@ void main() {
 
     // Cronet's own success arrives once both sides are closed, and changes nothing.
     await plugin.emit({'callId': id, 'type': 'done'});
+  });
+
+  group('read-idle timeout', () {
+    Future<Map<Object?, Object?>> openArgs(NativeHttpClient client) async {
+      unawaited(client.httpClient(request(null)).then((_) {}, onError: (_) {}));
+      await settle();
+      return plugin.callsTo('open').last.arguments as Map;
+    }
+
+    test('is off unless configured', () async {
+      expect((await openArgs(client))['readIdleTimeoutMs'], isNull);
+    });
+
+    test('applies to every call of a client configured with it', () async {
+      final configured = await CronetHttpClient.create(const NativeHttpConfig(readIdleTimeout: Duration(seconds: 3)));
+      expect((await openArgs(configured))['readIdleTimeoutMs'], 3000);
+      expect((await openArgs(configured))['readIdleTimeoutMs'], 3000);
+    });
+
+    test('zero is none', () async {
+      final configured = await CronetHttpClient.create(const NativeHttpConfig(readIdleTimeout: Duration.zero));
+      expect((await openArgs(configured))['readIdleTimeoutMs'], isNull);
+    });
+
+    test('rounds up to whole milliseconds', () async {
+      final configured = await CronetHttpClient.create(
+        const NativeHttpConfig(readIdleTimeout: Duration(microseconds: 1)),
+      );
+      expect((await openArgs(configured))['readIdleTimeoutMs'], 1);
+    });
+
+    test('a negative timeout is refused', () async {
+      await expectLater(
+        CronetHttpClient.create(const NativeHttpConfig(readIdleTimeout: Duration(seconds: -1))),
+        throwsArgumentError,
+      );
+    });
+
+    test('a timeout fails the call as unavailable, with the platform code', () async {
+      final response = client.httpClient(request(null));
+      await settle();
+      await plugin.failed(plugin.lastCallId, streamReady: true, internalErrorCode: -7);
+      final cause = await failureCause(response);
+      expect(cause.platformCode, -7);
+      expect(cause.failure, NativeHttpFailure.other);
+    });
   });
 
   test('close shuts the engine down', () async {

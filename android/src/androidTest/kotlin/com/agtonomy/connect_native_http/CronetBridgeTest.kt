@@ -92,6 +92,56 @@ class CronetBridgeTest {
     }
 
     @Test
+    fun aReadIdleTimeoutFailsAQuietCallAndTheEngineCarriesOn() {
+        val engine = createEngine()
+        // The timer also runs while the connection is set up, which through the emulator once took longer than the
+        // timeout (the TLS handshake was cut off). A call first leaves a connection for the timed one to reuse.
+        assertSayWorks(engine, 10)
+        open(engine, 1, CONVERSE, "application/connect+proto", readIdleTimeoutMs = 500)
+        await(1, "data")
+        val start = System.nanoTime()
+        val outcome = awaitOutcome(1)
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
+        assertEquals("failed", outcome["type"])
+        assertEquals(-7, outcome["internalErrorCode"])
+        assertEquals(true, outcome["streamReady"])
+        assertTrue("a 500 ms read-idle timeout took $elapsedMs ms", elapsedMs < 2000)
+        // Cronet's own cancel follows, and changes nothing.
+        Thread.sleep(200)
+        assertEquals(listOf(outcome), events.filter { it["callId"] == 1 && it["type"] in OUTCOMES } + drained(1))
+
+        // New calls go to a fresh CronetEngine.
+        assertSayWorks(engine, 2)
+    }
+
+    @Test
+    fun receivingResetsTheReadIdleTimer() {
+        val engine = createEngine()
+        assertSayWorks(engine, 10)
+        open(engine, 1, CONVERSE, "application/connect+proto", readIdleTimeoutMs = 1000)
+        await(1, "data")
+        // Twice the timeout in all, 600 ms between replies.
+        for (i in 0 until 3) {
+            Thread.sleep(600)
+            invoke("write", mapOf("callId" to 1, "data" to envelope(sentence("ping $i"))))
+            awaitReceived(1, "echo: ping $i")
+        }
+        invoke("write", mapOf("callId" to 1, "data" to envelope(sentence("bye"))))
+        assertEquals("done", awaitOutcome(1)["type"])
+    }
+
+    // A call that hit its deadline is canceled at once, and moves the engine's new calls to a fresh CronetEngine.
+    @Test
+    fun aDeadlineCancelEndsTheCallAndTheEngineCarriesOn() {
+        val engine = createEngine()
+        open(engine, 1, CONVERSE, "application/connect+proto")
+        await(1, "data")
+        invoke("cancel", mapOf("callId" to 1, "evictConnection" to true))
+        assertEquals("canceled", awaitOutcome(1)["type"])
+        assertSayWorks(engine, 2)
+    }
+
+    @Test
     fun malformedArgumentsAreRefusedInsteadOfCrashing() {
         val engine = createEngine()
         val malformed: List<Pair<String, Map<String, Any?>>> = listOf(
@@ -101,6 +151,9 @@ class CronetBridgeTest {
             "end" to mapOf("callId" to null),
             "cancel" to emptyMap<String, Any?>(),
             "shutdownEngine" to mapOf("engineId" to 1.5),
+            "open" to openArguments(engine, 1, SAY, "application/proto") + ("readIdleTimeoutMs" to 0),
+            "open" to openArguments(engine, 1, SAY, "application/proto") + ("readIdleTimeoutMs" to "soon"),
+            "cancel" to mapOf("callId" to 1, "evictConnection" to "yes"),
         )
         for ((method, arguments) in malformed) {
             val reply = reply(method, arguments)
@@ -139,16 +192,26 @@ class CronetBridgeTest {
         path: String,
         contentType: String,
         extraHeaders: List<List<String>> = emptyList(),
+        readIdleTimeoutMs: Int? = null,
     ) {
-        invoke("open", mapOf(
-            "engineId" to engine,
-            "callId" to callId,
-            "url" to serverUrl + path,
-            "method" to "POST",
-            "headers" to listOf(listOf("content-type", contentType), listOf("connect-protocol-version", "1")) +
-                extraHeaders,
-        ))
+        invoke("open", openArguments(engine, callId, path, contentType, extraHeaders) +
+            ("readIdleTimeoutMs" to readIdleTimeoutMs))
     }
+
+    private fun openArguments(
+        engine: Int,
+        callId: Int,
+        path: String,
+        contentType: String,
+        extraHeaders: List<List<String>> = emptyList(),
+    ): Map<String, Any?> = mapOf(
+        "engineId" to engine,
+        "callId" to callId,
+        "url" to serverUrl + path,
+        "method" to "POST",
+        "headers" to listOf(listOf("content-type", contentType), listOf("connect-protocol-version", "1")) +
+            extraHeaders,
+    )
 
     // Each case opens a fresh connection to the host through the emulator, which once took 3 s to come up on CI (the
     // request reached the server just as a 3 s wait gave up). 10 s, like the Dart cases, still fails a real hang fast.
@@ -165,7 +228,27 @@ class CronetBridgeTest {
         }
     }
 
-    private fun awaitOutcome(callId: Int) = await(callId, "done", "failed", "canceled")
+    private fun awaitOutcome(callId: Int) = await(callId, *OUTCOMES.toTypedArray())
+
+    // Outcomes for [callId] that arrived since the last wait.
+    private fun drained(callId: Int): List<Map<String, Any?>> {
+        val more = mutableListOf<Map<String, Any?>>()
+        incoming.drainTo(more)
+        events.addAll(more)
+        return more.filter { it["callId"] == callId && it["type"] in OUTCOMES }
+    }
+
+    private fun awaitReceived(callId: Int, text: String) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (!received(callId).contains(text)) {
+            val left = deadline - System.nanoTime()
+            val next = if (left > 0) incoming.poll(left, TimeUnit.NANOSECONDS) else null
+            if (next == null) {
+                fail("timed out waiting for \"$text\" on call $callId; events: $events")
+            }
+            events.add(next!!)
+        }
+    }
 
     // The response body so far, as text; Connect framing and protobuf leave the sentences readable.
     private fun received(callId: Int): String = events
@@ -175,6 +258,7 @@ class CronetBridgeTest {
     private companion object {
         const val CONVERSE = "/connectrpc.eliza.v1.ElizaService/Converse"
         const val SAY = "/connectrpc.eliza.v1.ElizaService/Say"
+        val OUTCOMES = setOf("done", "failed", "canceled")
 
         // A SayRequest or ConverseRequest: field 1, the sentence.
         fun sentence(text: String): ByteArray {
