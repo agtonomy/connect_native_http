@@ -94,6 +94,9 @@ class CronetBridgeTest {
     @Test
     fun aReadIdleTimeoutFailsAQuietCallAndTheEngineCarriesOn() {
         val engine = createEngine()
+        // The timer also runs while the connection is set up, which through the emulator once took longer than the
+        // timeout (the TLS handshake was cut off). A call first leaves a connection for the timed one to reuse.
+        assertSayWorks(engine, 10)
         open(engine, 1, CONVERSE, "application/connect+proto", readIdleTimeoutMs = 500)
         await(1, "data")
         val start = System.nanoTime()
@@ -114,6 +117,7 @@ class CronetBridgeTest {
     @Test
     fun receivingResetsTheReadIdleTimer() {
         val engine = createEngine()
+        assertSayWorks(engine, 10)
         open(engine, 1, CONVERSE, "application/connect+proto", readIdleTimeoutMs = 1000)
         await(1, "data")
         // Twice the timeout in all, 600 ms between replies.

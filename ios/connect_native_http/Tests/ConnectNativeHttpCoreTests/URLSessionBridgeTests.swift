@@ -91,6 +91,12 @@ final class URLSessionBridgeTests: XCTestCase {
 
   func testReadIdleTimeoutFailsAQuietCallAndTheEngineCarriesOn() async throws {
     let engine = try await createEngine()
+    // The timeout also covers setting up the connection, which can outlast it on a loaded simulator. A call first
+    // leaves a connection for the timed one to reuse.
+    try await open(engine, callId: 10, path: Self.say, contentType: "application/proto")
+    try await write(10, sentence("warm up"))
+    try await invoke("end", ["callId": 10])
+    try await waitUntil("the warm-up call ended", timeout: 10) { self.outcome(10) != nil }
     try await open(
       engine, callId: 1, path: Self.converse, contentType: "application/connect+proto", readIdleTimeoutMs: 500)
     try await waitUntil("the greeting arrived") { self.received(1).contains("hello") }
