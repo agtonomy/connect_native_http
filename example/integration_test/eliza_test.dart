@@ -1,6 +1,7 @@
 // Runs connect_native_http's platform client against ../test_server on a device or simulator. Start it through
 // ../run_integration_tests.sh, which starts the server, trusts its CA on the device and passes these defines.
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' as io;
 
 import 'package:connect_native_http/connect_native_http.dart';
@@ -26,7 +27,8 @@ const unreachableUrl = String.fromEnvironment('UNREACHABLE_URL');
 /// The test server under a name its certificate does not cover.
 const untrustedUrl = String.fromEnvironment('UNTRUSTED_URL');
 
-/// The test server's plain-HTTP admin endpoint, which can freeze its HTTP/3 path (test_server/freeze.go).
+/// The test server's plain-HTTP admin endpoint, which can freeze its HTTP/3 path and lists the health checks it
+/// received (test_server/freeze.go).
 const adminUrl = String.fromEnvironment('ADMIN_URL');
 
 /// The QUIC idle timeout the test server advertises (its -max-idle).
@@ -38,10 +40,18 @@ const introduceInterval = Duration(milliseconds: 100);
 final class Harness {
   Harness._(this.native, this.eliza);
 
-  static Future<Harness> create(String baseUrl, {Set<Uri> http3Origins = const {}}) async {
+  static Future<Harness> create(
+    String baseUrl, {
+    Set<Uri> http3Origins = const {},
+    NativeKeepAlive? keepAlive,
+  }) async {
     late final Harness harness;
     final native = await NativeHttpClient.create(
-      NativeHttpConfig(http3Origins: http3Origins, onResponse: (info) => harness.platformProtocols.add(info.protocol)),
+      NativeHttpConfig(
+        http3Origins: http3Origins,
+        keepAlive: keepAlive,
+        onResponse: (info) => harness.platformProtocols.add(info.protocol),
+      ),
     );
     if (native == null) {
       throw StateError('no native client on this platform');
@@ -63,7 +73,13 @@ final class Harness {
   /// `X-Proto` of each response: the protocol the server saw.
   final serverProtocols = <String>[];
 
-  void recordHeaders(Headers headers) => serverProtocols.add(headers.get('x-proto')?.join(',') ?? '');
+  /// `X-Remote-Addr` of each response: the client's address as the server saw it, which identifies the connection.
+  final remoteAddrs = <String>[];
+
+  void recordHeaders(Headers headers) {
+    serverProtocols.add(headers.get('x-proto')?.join(',') ?? '');
+    remoteAddrs.add(headers.get('x-remote-addr')?.join(',') ?? '');
+  }
 }
 
 /// Every case finishes in a few seconds against a local server (most well under one); a hang should fail fast.
@@ -76,6 +92,19 @@ Future<void> admin(String path) async {
     final response = await (await client.postUrl(Uri.parse('$adminUrl$path'))).close();
     expect(response.statusCode, 200, reason: 'POST $adminUrl$path');
     await response.drain<void>();
+  } finally {
+    client.close();
+  }
+}
+
+/// Every health check the test server has received, oldest first: each one's `proto` and `remoteAddr`.
+Future<List<Map<String, Object?>>> healthChecks() async {
+  final client = io.HttpClient();
+  try {
+    final response = await (await client.getUrl(Uri.parse('$adminUrl/health-checks'))).close();
+    expect(response.statusCode, 200, reason: 'GET $adminUrl/health-checks');
+    final body = await response.transform(utf8.decoder).join();
+    return (jsonDecode(body) as List).cast<Map<String, Object?>>();
   } finally {
     client.close();
   }
@@ -242,6 +271,34 @@ void main() {
     expect(await responses.moveNext(), isTrue);
     expect(responses.current.sentence, 'echo: bye');
     expect(await responses.moveNext(), isFalse);
+    await requests.close();
+  });
+
+  testCase('keepalives reach the server over the connection of the quiet call they keep busy', (_) async {
+    if (adminUrl.isEmpty) {
+      markTestSkipped('needs ADMIN_URL');
+      return;
+    }
+    const interval = Duration(milliseconds: 500);
+    final kept = await Harness.create(
+      serverUrl,
+      http3Origins: {Uri.parse(serverUrl)},
+      keepAlive: const NativeKeepAlive(interval: interval, timeout: Duration(seconds: 2)),
+    );
+    addTearDown(kept.native.close);
+    final (requests, responses) = await openQuietConverse(kept);
+    final connection = kept.remoteAddrs.last;
+    expect(connection, isNotEmpty, reason: 'the server reports X-Remote-Addr');
+
+    await Future<void>.delayed(interval * 3 + const Duration(milliseconds: 300));
+    final onConnection = (await healthChecks()).where((check) => check['remoteAddr'] == connection).toList();
+    // One per interval while the stream is open, after the first interval.
+    expect(onConnection.length, greaterThanOrEqualTo(2), reason: 'health checks from $connection: $onConnection');
+    expect({for (final check in onConnection) check['proto']}, {kept.serverProtocols.last});
+
+    requests.add(ConverseRequest(sentence: 'still there'));
+    expect(await responses.moveNext(), isTrue);
+    expect(responses.current.sentence, 'echo: still there');
     await requests.close();
   });
 

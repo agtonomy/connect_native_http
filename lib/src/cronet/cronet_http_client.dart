@@ -1,6 +1,7 @@
 import 'package:flutter/services.dart';
 
 import '../channel/channel_http_client.dart';
+import '../channel/keep_alive.dart';
 import '../native_http_config.dart';
 import '../native_http_exception.dart';
 import 'cronet_error.dart';
@@ -32,6 +33,7 @@ final class CronetHttpClient extends ChannelHttpClient {
   CronetHttpClient._(int engineId, NativeHttpConfig config) : super(cronetBridge, engineId, config);
 
   static Future<CronetHttpClient> create(NativeHttpConfig config) async {
+    validateKeepAlive(config.keepAlive);
     final idle = config.quicIdleTimeout;
     if (idle != null && idle < const Duration(seconds: 1)) {
       throw ArgumentError.value(idle, 'quicIdleTimeout', 'Cronet takes whole seconds; use at least 1 s');

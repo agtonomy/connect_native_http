@@ -8,7 +8,8 @@
 //
 // -max-idle and -keepalive set the server's QUIC idle timeout and ping interval. QUIC uses the smaller of the two
 // endpoints' idle timeouts, so -max-idle also bounds how long a client takes to notice a dead path. -admin-addr
-// serves a plain-HTTP endpoint that freezes the HTTP/3 path (see adminHandler).
+// serves a plain-HTTP endpoint that freezes the HTTP/3 path and lists the health checks received (see
+// adminHandler).
 package main
 
 import (
@@ -29,6 +30,7 @@ import (
 
 	"connectrpc.com/connect/v2"
 	"connectrpc.com/connect/v2/connecthttp"
+	"connectrpc.com/grpchealth/v2"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/qlog"
@@ -66,7 +68,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	handler := protocolHeaders(newElizaMux(), *altSvc)
+	health := &healthLog{}
+	handler := protocolHeaders(health.record(newElizaMux()), *altSvc)
 	tlsConfig := newTLSConfig(cert)
 	h2 := &http.Server{Addr: *addr, Handler: handler, TLSConfig: tlsConfig, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
@@ -89,7 +92,7 @@ func main() {
 			}
 		}()
 		if *adminAddr != "" {
-			admin := &http.Server{Addr: *adminAddr, Handler: adminHandler(conn), ReadHeaderTimeout: 10 * time.Second}
+			admin := &http.Server{Addr: *adminAddr, Handler: adminHandler(conn, health), ReadHeaderTimeout: 10 * time.Second}
 			go func() {
 				if err := admin.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					log.Fatalf("admin: %v", err)
@@ -125,9 +128,11 @@ func newHTTP3Server(handler http.Handler, tlsConfig *tls.Config, quicConfig *qui
 	}
 }
 
+// newElizaMux serves the eliza service, and gRPC's health service for connect_native_http's keepalive.
 func newElizaMux() *http.ServeMux {
 	server := connect.NewServer()
 	elizav1connect.RegisterElizaServiceHandler(server, elizaServer{})
+	grpchealth.Register(server, grpchealth.NewStaticChecker())
 	mux := http.NewServeMux()
 	connecthttp.Mount(mux, server)
 	// A 307 makes a client send the same request body again, to the path after /redirect. The body is read first:
@@ -142,11 +147,13 @@ func newElizaMux() *http.ServeMux {
 }
 
 // protocolHeaders logs each request and reports the protocol it arrived on in X-Proto, which is how tests check
-// for HTTP/3 on clients that don't expose the negotiated protocol. HTTP/2 responses also advertise HTTP/3.
+// for HTTP/3 on clients that don't expose the negotiated protocol, and the client's address in X-Remote-Addr, which
+// identifies the connection. HTTP/2 responses also advertise HTTP/3.
 func protocolHeaders(next http.Handler, altSvc string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s %s from %s", r.Proto, r.Method, r.URL.Path, r.RemoteAddr)
 		w.Header().Set("X-Proto", r.Proto)
+		w.Header().Set("X-Remote-Addr", r.RemoteAddr)
 		if r.ProtoMajor < 3 && altSvc != "" {
 			w.Header().Set("Alt-Svc", altSvc)
 		}

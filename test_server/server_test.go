@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -11,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -168,7 +171,7 @@ func TestFrozenPathFailsOpenStreamWithinIdleTimeout(t *testing.T) {
 
 func TestAdminFreezeAndUnfreeze(t *testing.T) {
 	conn := &freezablePacketConn{}
-	handler := adminHandler(conn)
+	handler := adminHandler(conn, &healthLog{})
 	post := func(target string) int {
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, target, nil))
@@ -379,5 +382,46 @@ func TestAltSvcOnlyOnTCPResponses(t *testing.T) {
 		if got := w.Header().Get("Alt-Svc"); got != tc.wantAltSvc {
 			t.Errorf("HTTP/%d: Alt-Svc = %q, want %q", tc.major, got, tc.wantAltSvc)
 		}
+	}
+}
+
+func TestHealthCheckIsServedAndLogged(t *testing.T) {
+	health := &healthLog{}
+	handler := protocolHeaders(health.record(newElizaMux()), "")
+	post := func(path string) *httptest.ResponseRecorder {
+		// An empty body: a HealthCheckRequest for the whole server, or an empty SayRequest.
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.Header.Set("Content-Type", "application/proto")
+		req.Header.Set("Connect-Protocol-Version", "1")
+		req.RemoteAddr = "192.0.2.1:1234"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := post(healthCheckPath)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body)
+	}
+	// A HealthCheckResponse with status SERVING: field 1, varint 1.
+	if got, want := w.Body.Bytes(), []byte{0x08, 0x01}; !bytes.Equal(got, want) {
+		t.Errorf("body = %x, want %x", got, want)
+	}
+	if got := w.Header().Get("X-Remote-Addr"); got != "192.0.2.1:1234" {
+		t.Errorf("X-Remote-Addr = %q", got)
+	}
+	if code := post("/connectrpc.eliza.v1.ElizaService/Say").Code; code != http.StatusOK {
+		t.Fatalf("Say: status %d", code)
+	}
+
+	admin := httptest.NewRecorder()
+	adminHandler(&freezablePacketConn{}, health).ServeHTTP(admin, httptest.NewRequest(http.MethodGet, "/health-checks", nil))
+	var entries []healthLogEntry
+	if err := json.Unmarshal(admin.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("%v: %s", err, admin.Body)
+	}
+	want := []healthLogEntry{{Proto: "HTTP/1.1", RemoteAddr: "192.0.2.1:1234"}}
+	if !slices.Equal(entries, want) {
+		t.Errorf("health checks = %+v, want %+v (the Say call isn't one)", entries, want)
 	}
 }

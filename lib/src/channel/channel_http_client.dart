@@ -8,6 +8,7 @@ import '../native_http_client.dart';
 import '../native_http_config.dart';
 import '../native_http_exception.dart';
 import 'connect_end_stream.dart';
+import 'keep_alive.dart';
 
 /// A platform plugin that speaks this file's channel protocol: `createEngine`, `shutdownEngine`, `open`, `write`,
 /// `end` and `cancel` method calls, and `headers`, `data`, `trailers`, `responseComplete`, `done`, `failed` and
@@ -54,14 +55,29 @@ final class _Call {
   final response = Completer<HttpResponse>();
   final body = StreamController<Uint8List>();
   final trailer = Headers();
-  bool finished = false;
   ConnectEndStreamDetector? endStream;
 
   /// Set when the call's signal fired, so the outcome reports the signal's error rather than the cancellation.
   Object? abortError;
 
+  /// Called once, when the call finishes.
+  void Function()? onFinished;
+
+  bool get finished => _finished;
+  bool _finished = false;
+
+  void markFinished() {
+    if (_finished) {
+      return;
+    }
+    _finished = true;
+    final callback = onFinished;
+    onFinished = null;
+    callback?.call();
+  }
+
   void fail(Object error) {
-    finished = true;
+    markFinished();
     if (!response.isCompleted) {
       response.completeError(error);
     }
@@ -76,7 +92,7 @@ final class _Call {
 
   /// The server sent the whole response, so nothing more is sent.
   void completeResponse(String bridgeName) {
-    finished = true;
+    markFinished();
     if (!response.isCompleted) {
       response.completeError(ConnectException(Code.internal, '$bridgeName: response ended without headers'));
     }
@@ -233,7 +249,12 @@ final class _Dispatcher {
 
 /// A connect-dart [HttpClient] on one engine of a [PlatformBridge] plugin.
 base class ChannelHttpClient implements NativeHttpClient {
-  ChannelHttpClient(this._bridge, this._engineId, this._config);
+  ChannelHttpClient(this._bridge, this._engineId, this._config) {
+    final keepAlive = _config.keepAlive;
+    if (keepAlive != null) {
+      _keepAlive = KeepAliveMonitor(keepAlive, ping: _ping);
+    }
+  }
 
   /// Starts the bridge's event routing and creates an engine with [arguments], returning its id.
   static Future<int> createEngine(PlatformBridge bridge, Map<String, Object?> arguments) async {
@@ -244,15 +265,55 @@ base class ChannelHttpClient implements NativeHttpClient {
   final PlatformBridge _bridge;
   final int _engineId;
   final NativeHttpConfig _config;
+  KeepAliveMonitor? _keepAlive;
+
+  /// Origins whose keepalive got a response other than HTTP 200, which is reported only the first time.
+  final _keepAliveRefused = <Uri>{};
 
   @override
-  HttpClient get httpClient => _send;
+  HttpClient get httpClient =>
+      (req) => _send(req, keepAlive: true);
 
-  Future<HttpResponse> _send(HttpRequest req) async {
+  /// One keepalive request to [origin]. It isn't itself tracked, so it doesn't keep its own loop going, and it ends
+  /// quietly whatever happens: noticing a dead connection is left to the calls' own deadlines and timeouts.
+  Future<void> _ping(Uri origin) async {
+    final keepAlive = _config.keepAlive!;
+    final url = origin.replace(path: healthCheckPath).toString();
+    final signal = CancelableSignal();
+    final timer = Timer(keepAlive.timeout, () => signal.cancel('${_bridge.name}: keepalive to $origin timed out'));
+    try {
+      final response = await _send(
+        HttpRequest(url, 'POST', healthCheckHeaders(keepAlive.timeout), null, signal),
+        keepAlive: false,
+      );
+      await response.body.drain<void>();
+      if (response.status != 200 && _keepAliveRefused.add(origin)) {
+        reportError(
+          StateError(
+            '${_bridge.name}: keepalive: $url answered HTTP ${response.status}. Does the server register '
+            'grpc.health.v1.Health? The request still carried traffic.',
+          ),
+          StackTrace.current,
+          'while sending a keepalive to $origin',
+        );
+      }
+    } catch (_) {
+      // The request failed or timed out. Calls on a dead connection fail on their own.
+    } finally {
+      timer.cancel();
+    }
+  }
+
+  /// Sends [req]. With [keepAlive], the call counts as open for [NativeHttpConfig.keepAlive] until it finishes, and
+  /// [NativeHttpConfig.onResponse] sees its response.
+  Future<HttpResponse> _send(HttpRequest req, {required bool keepAlive}) async {
     final dispatcher = _Dispatcher.of(_bridge);
     final methods = _bridge.methods;
     final call = _Call(Uri.parse(req.url));
-    final id = dispatcher.register(call, _config.onResponse);
+    final id = dispatcher.register(call, keepAlive ? _config.onResponse : null);
+    if (keepAlive) {
+      call.onFinished = _keepAlive?.track(call.url);
+    }
     call.body.onCancel = () {
       if (!call.finished) {
         unawaited(dispatcher.cancel(id));
@@ -278,7 +339,7 @@ base class ChannelHttpClient implements NativeHttpClient {
     } catch (error) {
       // The plugin refused the call, or isn't there (a background isolate, say): nothing was sent.
       dispatcher.remove(id);
-      call.finished = true;
+      call.markFinished();
       final cause = NativeHttpException(NativeHttpFailure.notSent, '${_bridge.name}: open failed: $error');
       throw ConnectException(Code.unavailable, cause.message, cause: cause);
     }
@@ -313,5 +374,8 @@ base class ChannelHttpClient implements NativeHttpClient {
   }
 
   @override
-  Future<void> close() => _bridge.methods.invokeMethod<void>('shutdownEngine', {'engineId': _engineId});
+  Future<void> close() {
+    _keepAlive?.close();
+    return _bridge.methods.invokeMethod<void>('shutdownEngine', {'engineId': _engineId});
+  }
 }

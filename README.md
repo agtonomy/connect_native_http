@@ -76,6 +76,9 @@ found or verified with the tests in this package.
 - **No client-side dead-connection detection.** Neither stack sends HTTP/2 pings the caller controls, and server
   pings stop at any load balancer that terminates HTTP/2. Idle timeouts on the path must exceed a stream's longest
   quiet period, or the stream must carry periodic messages. See "QUIC idle timeout vs HTTP/2 keepalive pings".
+- **Register `grpc.health.v1.Health` on every server, if clients use `keepAlive`.** In connect-go:
+  `grpchealth.Register(server, grpchealth.NewStaticChecker())`. Route `/grpc.health.v1.Health/Check` through the
+  load balancer like the other procedures. See "Keepalive".
 
 **The HTTP/3 endpoint**
 
@@ -140,6 +143,32 @@ This does nothing on the **HTTP/2 fallback** used where UDP is blocked. Neither 
 connection that dies without the interface going down goes unnoticed until a call's deadline or an
 application-level heartbeat.
 
+### Keepalive
+
+`NativeHttpConfig.keepAlive` keeps a quiet connection carrying traffic, so nothing on the path closes it for being
+idle: a load balancer's idle timeout (an AWS ALB's is 60 s by default), a NAT mapping, or the server's own. It is
+opt-in, and the same on both platforms:
+
+```dart
+NativeHttpConfig(
+  http3Origins: {origin},
+  keepAlive: const NativeKeepAlive(interval: Duration(seconds: 15), timeout: Duration(seconds: 10)),
+)
+```
+
+- While a client has calls open to an origin, it sends a `grpc.health.v1.Health/Check` request there every
+  `interval`: a Connect unary call with an empty `HealthCheckRequest`, over the same URLSession or Cronet engine. It
+  takes the same connection as the calls, which the integration tests check from the server's side.
+- One request at a time per origin, starting one `interval` after the first call opens and stopping once none is
+  open. A request that hasn't ended after `timeout` is canceled.
+- It only keeps the connection busy. It doesn't fail calls or notice a dead connection, and a request on another
+  stream isn't data on a call's own stream, so it doesn't satisfy a read timeout on that call. Any response counts,
+  since the request is for traffic, not the server's health. A response other than HTTP 200 is reported once per
+  origin through `FlutterError.onError`, since it usually means the server doesn't register the service.
+- Unlike HTTP/2 PING frames, which a load balancer that ends HTTP/2 answers itself, these requests reach the server.
+- Over HTTP/3 the server's QUIC pings already keep the path busy, so keepalive mostly matters on the HTTP/2 path.
+- Keepalive requests don't reach `onResponse`.
+
 ### QUIC idle timeout vs HTTP/2 keepalive pings
 
 The two mechanisms differ in who notices a dead path, which is why server settings protect the phone over HTTP/3 but
@@ -193,12 +222,13 @@ Neither platform finishes a stream on its own while the client still has its req
 ## Tests
 
 - **`test/`:** host unit tests, runnable on Linux CI. They cover error classification, Connect end-stream detection,
-  URLSession response headers, and the shared channel adapter against a fake plugin.
+  URLSession response headers, and the shared channel adapter, keepalive included, against a fake plugin.
 - **`test_server/`:** a Go server for `connectrpc.eliza.v1.ElizaService` over HTTP/2 and HTTP/3, scripted for tests
   (see `eliza.go`).
   - `-max-idle` and `-keepalive` set its QUIC idle timeout and ping interval.
   - `-admin-addr` serves `POST /freeze?for=10s` and `POST /unfreeze`, which drop all its UDP traffic so a test can
-    simulate a dead HTTP/3 path.
+    simulate a dead HTTP/3 path, and `GET /health-checks`, the health checks it has received.
+  - It serves `grpc.health.v1.Health` for keepalive, and reports each request's client address in `X-Remote-Addr`.
   - Its own tests (`go test ./...`) check it over HTTP/3, including the idle timeout, pings and freezing.
   - It creates a CA in `test_server/certs/` on first start and reuses it, so a device only has to trust it once.
   - With `QLOGDIR` set, it writes a qlog trace of each QUIC connection there, which shows the server's side of a
@@ -222,6 +252,8 @@ Neither platform finishes a stream on its own while the client still has its req
   iOS, and HTTP/2 on Android, since the server's private CA keeps Cronet off QUIC. On iOS a fresh client's first call,
   before any Alt-Svc, must reach HTTP/3 within a few fresh clients. A loaded simulator sometimes lets TCP win
   URLSession's race even locally, so a single fallback is logged rather than failed.
+
+  It also checks that keepalives reach the server on the same connection as a quiet stream.
 
   The script starts the server with a 3 s idle timeout and 1 s pings. Over HTTP/3 (iOS) the tests also check two
   things: a quiet stream outlives the idle timeout, and a frozen path fails an open stream within it.

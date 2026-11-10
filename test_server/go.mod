@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	connectrpc.com/connect/v2 v2.0.1
+	connectrpc.com/grpchealth/v2 v2.0.0
 	github.com/quic-go/quic-go v0.65.0
 	google.golang.org/protobuf v1.36.12
 )
