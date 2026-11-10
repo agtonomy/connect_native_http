@@ -74,11 +74,27 @@ NativeHttpConfig(readIdleTimeout: const Duration(seconds: 30));
 - **The failure:** `unavailable`, with a `NativeHttpException` whose `platformCode` is `NSURLErrorTimedOut` (-1001) on
   iOS or `net::ERR_TIMED_OUT` (-7) on Android. On Android a timeout before `onStreamReady` is `notSent`, as with any
   other failure there.
-- **The connection:** a timeout is taken as a sign the connection is dead, and the connection is evicted. Neither stack
-  can close a single connection, so the client moves its new calls to a fresh `URLSession` or `CronetEngine`, which
-  dials its own connections. Calls already on the old one finish there, and it is released after the last one ends.
+- **The connection:** see "Calls that run out of time" below.
 - **The header:** the value travels in a `native-http-read-idle-timeout-ms` request header (`readIdleTimeoutHeader`),
   which the client removes before sending. connect-dart's `CallOptions` carry nothing else per call.
+
+### Calls that run out of time
+
+A call that hits its read-idle timeout or its deadline may be stuck on a dead connection. The client keeps new calls
+off such a connection, so they don't wait on it too.
+
+- **Read-idle timeout:** the connection counts as dead if nothing has arrived from the call's origin (host and port),
+  on any call, since the call last received anything. If something has, the connection is alive and only that call
+  was slow, so nothing changes.
+- **Deadline:** the call fails at its deadline, as always. connect-dart sends the deadline in `connect-timeout-ms`, so
+  the server times the call out too and answers `deadline_exceeded`. Its clock starts later, so its answer arrives
+  about a round trip after the client's deadline. The bridge therefore keeps the stream open for 1 s more before
+  canceling it. If anything arrives from the origin in that time, the server's answer included, the connection is
+  alive. If nothing does, it counts as dead.
+- **A dead connection is evicted.** Neither stack can close a single connection, so the client moves its new calls to
+  a fresh `URLSession` or `CronetEngine`, which dials its own connections. Calls already on the old one are not
+  canceled. They finish there, and it is released after the last one ends. Several calls that run out of time on the
+  same connection evict it once.
 
 ## Server and infrastructure requirements
 
@@ -167,12 +183,14 @@ Clients may enforce a floor on the peer's value. quic-go's client raises anythin
 (`protocol.MinRemoteIdleTimeout`), so measure any other client before relying on a short server value.
 
 None of this works on the **HTTP/2 fallback** used where UDP is blocked. Neither stack exposes HTTP/2 pings, so a TCP
-connection that dies without the interface going down goes unnoticed until a call's deadline, an application-level
-heartbeat, or a read-idle timeout. The integration tests check both sides:
+connection that dies without the interface going down goes unnoticed until a call on it runs out of time: a deadline
+or a read-idle timeout (see "Calls that run out of time"). The integration tests check this:
 
-- Without a read-idle timeout, a frozen HTTP/2 connection draws no error for 3 s, and a new call on the same client
-  waits on it until its deadline.
-- With one, the call fails within the timeout, and the client's next call goes out on a new connection.
+- Over a frozen HTTP/2 connection nothing arrives for 3 s, and a new call on the same client waits on it until its
+  deadline. The call after that goes out on a new connection.
+- With a read-idle timeout, the call fails within the timeout, and the client's next call goes out on a new
+  connection.
+- A call the server answers with `deadline_exceeded` leaves the client on the same connection.
 
 ### QUIC idle timeout vs HTTP/2 keepalive pings
 
@@ -266,18 +284,21 @@ Neither platform finishes a stream on its own while the client still has its req
   things: a quiet stream outlives the idle timeout, and a frozen path fails an open stream within it.
 
   The read-idle timeout is tested over HTTP/2 on both platforms. On iOS each of these cases freezes the server's UDP
-  first, so URLSession falls back to TCP as it would where UDP is blocked. The cases check four things:
+  first, so URLSession falls back to TCP as it would where UDP is blocked. The server reports each call's client
+  address in `X-Remote-Addr`, which shows whether two calls shared a connection. The cases check five things:
   - A quiet stream fails at its timeout.
   - A stream that keeps receiving outlives its timeout.
-  - Without a timeout, a frozen connection goes unnoticed. This is the control.
-  - With one, the call fails and the client's next call works, which it can only do on a new connection.
+  - A frozen connection draws no error, and new calls go to it until one hits its deadline. The call after that is
+    on a new connection.
+  - With a read-idle timeout, the call fails and the client's next call is on a new connection.
+  - A deadline the server answers leaves the client on the same connection.
 - **Native bridge tests:** the same script runs them after the Dart tests, against the same server. Each platform's
   bridge (`URLSessionBridge`, `CronetBridge`) has no Flutter dependency, and the tests call it directly, for behavior
   Dart can't reach:
   - **iOS (`ios/connect_native_http/Tests`, XCTest):** a write stuck on a full buffer returns once the call is
     canceled or its connection fails; a redirect of a request with a body is returned, not followed; shutting a
     session down lets its calls finish and refuses new ones; a read-idle timeout fails a quiet call with
-    `NSURLErrorTimedOut`, and the engine's next call works. The script runs them on the simulator. For a quick loop
+    `NSURLErrorTimedOut`, and the engine's next call works; a deadline cancel waits out its grace period. The script runs them on the simulator. For a quick loop
     on the Mac, against a running test server:
 
     ```bash
@@ -289,7 +310,7 @@ Neither platform finishes a stream on its own while the client still has its req
     write after the server finished the call is dropped instead of crashing; shutting an engine down lets its calls
     finish and refuses new ones; a header Cronet rejects fails its call as never sent; an empty write is skipped; a
     read-idle timeout fails a quiet call with -7, once, and the engine's next call works; data arriving resets the
-    timer.
+    timer; a deadline cancel waits out its grace period.
   - Both platforms' suites also check that malformed method calls get an error reply and leave the bridge working.
 - **`example/integration_test/public_server_test.dart`:** HTTP/3 on Android against a server with a public
   certificate. It also checks that `quicIdleTimeout` ends a quiet connection, against a control without it. It is

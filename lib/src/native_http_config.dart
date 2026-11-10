@@ -40,9 +40,10 @@ final class NativeHttpConfig {
   /// - **Android:** a timer in the bridge, which fails the call with `net::ERR_TIMED_OUT` (-7).
   /// - **The failure:** a `ConnectException` with code `unavailable`, whose cause is a [NativeHttpException] with
   ///   that `platformCode`.
-  /// - **The connection:** a call that timed out is taken as a sign its connection is dead. The client moves new calls
-  ///   to a fresh `URLSession` or Cronet engine, so they dial a new connection, and lets the calls already on the old
-  ///   one finish there.
+  /// - **The connection:** if nothing has arrived from the call's origin, on any call, since the call last received
+  ///   anything, the connection is taken to be dead. The client moves new calls to a fresh `URLSession` or Cronet
+  ///   engine, so they dial a new connection, and lets the calls already on the old one finish there. A call that hits
+  ///   its deadline is checked the same way, after a 1 s grace period for the server's own `deadline_exceeded`.
   final Duration? readIdleTimeout;
 
   /// Called with each response's headers, before its body is read. An exception it throws goes to

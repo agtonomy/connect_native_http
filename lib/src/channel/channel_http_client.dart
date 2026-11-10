@@ -134,9 +134,17 @@ final class _Dispatcher {
 
   /// Asks the plugin to cancel call [id]; its `canceled` event then ends the call. Should the plugin fail to take the
   /// request, no event will come, so the call ends here instead.
-  Future<void> cancel(int id) async {
+  ///
+  /// With [deadlineGrace], the call has hit its deadline and already failed here. The plugin then waits up to that long
+  /// before canceling it, for anything from the call's origin: the server's own `deadline_exceeded`, typically, since
+  /// connect-dart sends the deadline and the server's clock starts later. If nothing arrives, the call is taken to be
+  /// stuck on a dead connection, and new calls move to a fresh one.
+  Future<void> cancel(int id, {Duration? deadlineGrace}) async {
     try {
-      await bridge.methods.invokeMethod<void>('cancel', {'callId': id});
+      await bridge.methods.invokeMethod<void>('cancel', {
+        'callId': id,
+        if (deadlineGrace != null) 'deadlineGraceMs': deadlineGrace.inMilliseconds,
+      });
     } catch (error, stack) {
       final call = remove(id);
       call?.fail(call.abortError ?? ConnectException(Code.canceled, '${bridge.name}: cancel failed: $error'));
@@ -232,6 +240,10 @@ final class _Dispatcher {
   }
 }
 
+/// How long the plugin keeps a call that hit its deadline, waiting for a sign its connection is alive. Covers the
+/// server's own `deadline_exceeded`, which arrives about a round trip after the client's deadline.
+const deadlineGrace = Duration(seconds: 1);
+
 /// A connect-dart [HttpClient] on one engine of a [PlatformBridge] plugin.
 base class ChannelHttpClient implements NativeHttpClient {
   ChannelHttpClient(this._bridge, this._engineId, this._config);
@@ -274,10 +286,19 @@ base class ChannelHttpClient implements NativeHttpClient {
       }
     };
     req.signal?.future.then((error) {
-      if (!call.finished) {
-        call.abortError = error;
-        unawaited(dispatcher.cancel(id));
+      if (call.finished) {
+        return;
       }
+      call.abortError = error;
+      if (error.code == Code.deadlineExceeded) {
+        // The caller gets the deadline now; the plugin keeps the stream a little longer to tell whether its connection
+        // is dead (see _Dispatcher.cancel), and nothing it reports for the call matters any more.
+        dispatcher.remove(id);
+        call.fail(error);
+        unawaited(dispatcher.cancel(id, deadlineGrace: deadlineGrace));
+        return;
+      }
+      unawaited(dispatcher.cancel(id));
     });
     try {
       await methods.invokeMethod<void>('open', {

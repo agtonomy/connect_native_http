@@ -470,5 +470,8 @@ func TestAltSvcOnlyOnTCPResponses(t *testing.T) {
 		if got := w.Header().Get("Alt-Svc"); got != tc.wantAltSvc {
 			t.Errorf("HTTP/%d: Alt-Svc = %q, want %q", tc.major, got, tc.wantAltSvc)
 		}
+		if got := w.Header().Get("X-Remote-Addr"); got != req.RemoteAddr {
+			t.Errorf("HTTP/%d: X-Remote-Addr = %q, want %q", tc.major, got, req.RemoteAddr)
+		}
 	}
 }

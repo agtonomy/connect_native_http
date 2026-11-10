@@ -36,6 +36,8 @@ public final class URLSessionBridge {
     // Replaced after a call times out, so new calls dial a fresh connection; see `evictConnection`.
     var urlSession: URLSession
     let http3Origins: Set<String>
+    // When `urlSession` last received anything from each origin ("host:port"), in uptime nanoseconds.
+    var lastReceived: [String: UInt64] = [:]
 
     init(urlSession: URLSession, http3Origins: Set<String>) {
       self.urlSession = urlSession
@@ -48,6 +50,9 @@ public final class URLSessionBridge {
     var engineId = 0
     // The URLSession the call's task runs in.
     var urlSession: URLSession?
+    var origin = ""
+    // When the call last received anything, or started, in uptime nanoseconds.
+    var lastReceived = URLSessionBridge.now()
     var task: URLSessionTask!
     var input: InputStream?
     var output: OutputStream?
@@ -113,12 +118,7 @@ public final class URLSessionBridge {
       let headers: [[String]] = try arg(args, "headers")
       guard headers.allSatisfy({ $0.count == 2 }) else { throw BadArgument(name: "headers") }
       let hasBody: Bool = try arg(args, "hasBody")
-      // Absent or null for none.
-      var readIdleTimeoutMs: Int?
-      if let value = args["readIdleTimeoutMs"], !(value is NSNull) {
-        guard let ms = value as? Int, ms > 0 else { throw BadArgument(name: "readIdleTimeoutMs") }
-        readIdleTimeoutMs = ms
-      }
+      let readIdleTimeoutMs = try optionalPositiveInt(args, "readIdleTimeoutMs")
       queue.async { self.open(engineId, callId, url, method, headers, hasBody, readIdleTimeoutMs) }
       reply(.success(nil))
     case "write":
@@ -144,11 +144,31 @@ public final class URLSessionBridge {
       reply(.success(nil))
     case "cancel":
       let callId: Int = try arg(args, "callId")
-      queue.async { self.calls[callId]?.task.cancel() }
+      // Set when the call hit its deadline: see `cancelAfterDeadline`.
+      let deadlineGraceMs = try optionalPositiveInt(args, "deadlineGraceMs")
+      queue.async {
+        guard let c = self.calls[callId] else { return }
+        if let deadlineGraceMs {
+          self.cancelAfterDeadline(c, graceMs: deadlineGraceMs)
+        } else {
+          c.task.cancel()
+        }
+      }
       reply(.success(nil))
     default:
       reply(.notImplemented)
     }
+  }
+
+  /// An optional argument that must be a positive integer when present; absent or null for none.
+  private func optionalPositiveInt(_ args: [String: Any], _ name: String) throws -> Int? {
+    guard let value = args[name], !(value is NSNull) else { return nil }
+    guard let n = value as? Int, n > 0 else { throw BadArgument(name: name) }
+    return n
+  }
+
+  static func now() -> UInt64 {
+    DispatchTime.now().uptimeNanoseconds
   }
 
   private func failure(_ callId: Int, domain: String, code: Int, message: String) -> [String: Any] {
@@ -201,6 +221,7 @@ public final class URLSessionBridge {
     let c = Call(callId: callId)
     c.engineId = engineId
     c.urlSession = session.urlSession
+    c.origin = "\(target.host ?? ""):\(port)"
     if hasBody {
       var input: InputStream?
       var output: OutputStream?
@@ -248,14 +269,26 @@ public final class URLSessionBridge {
     callsByTask[task]?.input == nil
   }
 
+  // Anything from the server shows the call's connection is alive.
+  private func received(_ c: Call) {
+    let now = Self.now()
+    c.lastReceived = now
+    if let session = sessions[c.engineId], session.urlSession === c.urlSession {
+      session.lastReceived[c.origin] = now
+    }
+  }
+
   fileprivate func didReceive(_ response: URLResponse, for task: URLSessionTask) {
-    guard let c = callsByTask[task], let http = response as? HTTPURLResponse else { return }
+    guard let c = callsByTask[task] else { return }
+    received(c)
+    guard let http = response as? HTTPURLResponse else { return }
     let headers = http.allHeaderFields.map { [String(describing: $0.key), String(describing: $0.value)] }
     emit(["callId": c.callId, "type": "headers", "status": http.statusCode, "protocol": NSNull(), "headers": headers])
   }
 
   fileprivate func didReceive(_ data: Data, for task: URLSessionTask) {
     guard let c = callsByTask[task] else { return }
+    received(c)
     emit(["callId": c.callId, "type": "data", "data": data])
   }
 
@@ -284,14 +317,33 @@ public final class URLSessionBridge {
     emit(failure(c.callId, domain: error.domain, code: error.code, message: error.localizedDescription))
   }
 
-  // A call that timed out is taken as a sign its connection is dead. URLSession pools connections per session and has
-  // no call that closes one, so the engine's new calls go to a fresh URLSession, which dials its own connections. The
-  // old one finishes the tasks it still has, and is then released. Calls that time out together on the same dead
-  // connection replace it once.
+  // A call that ran out of time (its read-idle timeout, or its deadline and grace) may be stuck on a dead connection.
+  // It is taken to be if nothing has arrived from the call's origin, on any call, since the call last received
+  // anything; otherwise only that call was slow. URLSession pools connections per session and has no call that closes
+  // one, so the engine's new calls go to a fresh URLSession, which dials its own connections. The old one finishes the
+  // tasks it still has, and is then released. Calls that time out together on the same dead connection replace it
+  // once.
   private func evictConnection(of c: Call) {
     guard let session = sessions[c.engineId], let old = c.urlSession, session.urlSession === old else { return }
+    if let heard = session.lastReceived[c.origin], heard > c.lastReceived {
+      return
+    }
     session.urlSession = makeURLSession()
+    session.lastReceived = [:]
     old.finishTasksAndInvalidate()
+  }
+
+  // The call has hit its deadline and Dart has already failed it. The server enforces the same deadline and answers
+  // about a round trip later, so the task stays open for the grace period: an answer, or anything else from the
+  // origin, shows the connection is alive. After it, the task is canceled, and the connection evicted if it stayed
+  // quiet.
+  private func cancelAfterDeadline(_ c: Call, graceMs: Int) {
+    queue.asyncAfter(deadline: .now() + .milliseconds(graceMs)) {
+      // Gone: the server's answer ended it, or the stack failed it.
+      guard self.calls[c.callId] === c else { return }
+      self.evictConnection(of: c)
+      c.task.cancel()
+    }
   }
 
   fileprivate func serverTrust(_ challenge: URLAuthenticationChallenge) -> (

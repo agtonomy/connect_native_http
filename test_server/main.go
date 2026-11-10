@@ -148,11 +148,13 @@ func newElizaMux() *http.ServeMux {
 }
 
 // protocolHeaders logs each request and reports the protocol it arrived on in X-Proto, which is how tests check
-// for HTTP/3 on clients that don't expose the negotiated protocol. HTTP/2 responses also advertise HTTP/3.
+// for HTTP/3 on clients that don't expose the negotiated protocol, and the client's address in X-Remote-Addr, which
+// tells a test whether two calls shared a connection. HTTP/2 responses also advertise HTTP/3.
 func protocolHeaders(next http.Handler, altSvc string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s %s from %s", r.Proto, r.Method, r.URL.Path, r.RemoteAddr)
 		w.Header().Set("X-Proto", r.Proto)
+		w.Header().Set("X-Remote-Addr", r.RemoteAddr)
 		if r.ProtoMajor < 3 && altSvc != "" {
 			w.Header().Set("Alt-Svc", altSvc)
 		}

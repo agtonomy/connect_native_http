@@ -10,6 +10,7 @@ import org.chromium.net.CronetException
 import org.chromium.net.NetworkException
 import org.chromium.net.QuicOptions
 import org.chromium.net.UrlResponseInfo
+import java.net.URI
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -43,6 +44,9 @@ class CronetBridge(
     // a fresh one, with its own connections, and the retired one shuts down once its last call ends.
     private class Pool(val cronet: CronetEngine) {
         val callIds = HashSet<Int>()
+
+        // When this engine last received anything from each origin ("host:port"), in System.nanoTime().
+        val lastReceived = HashMap<String, Long>()
     }
 
     private class Engine(val options: EngineOptions, var current: Pool) {
@@ -50,7 +54,13 @@ class CronetBridge(
         var shuttingDown = false
     }
 
-    private class Call(val callId: Int, val engineId: Int, val pool: Pool, val readIdleTimeoutNanos: Long?) {
+    private class Call(
+        val callId: Int,
+        val engineId: Int,
+        val pool: Pool,
+        val origin: String,
+        val readIdleTimeoutNanos: Long?,
+    ) {
         lateinit var stream: BidirectionalStream
 
         // When the call last received anything from the server, or started, for its read-idle timeout.
@@ -158,7 +168,17 @@ class CronetBridge(
             }
             "cancel" -> {
                 val callId = args["callId"] as Int
-                execute(callId) { calls[callId]?.stream?.cancel() }
+                // Set when the call hit its deadline: see cancelAfterDeadline.
+                val deadlineGraceMs = (args["deadlineGraceMs"] as Number?)?.toLong()
+                require(deadlineGraceMs == null || deadlineGraceMs > 0) { "deadlineGraceMs: $deadlineGraceMs" }
+                execute(callId) {
+                    val c = calls[callId] ?: return@execute
+                    if (deadlineGraceMs != null) {
+                        cancelAfterDeadline(c, deadlineGraceMs)
+                    } else {
+                        c.stream.cancel()
+                    }
+                }
                 result(Reply.Success(null))
             }
             else -> result(Reply.NotImplemented)
@@ -192,7 +212,15 @@ class CronetBridge(
             return
         }
         val pool = engine.current
-        val c = Call(callId, engineId, pool, readIdleTimeoutMs?.let { TimeUnit.MILLISECONDS.toNanos(it) })
+        val target = URI(url)
+        val port = if (target.port != -1) target.port else if (target.scheme == "http") 80 else 443
+        val c = Call(
+            callId,
+            engineId,
+            pool,
+            "${target.host}:$port",
+            readIdleTimeoutMs?.let { TimeUnit.MILLISECONDS.toNanos(it) },
+        )
         val builder = pool.cronet.newBidirectionalStreamBuilder(url, Callback(c), executor).setHttpMethod(method)
         for ((name, value) in headers) {
             builder.addHeader(name, value)
@@ -241,17 +269,45 @@ class CronetBridge(
         evict(c)
     }
 
+    // Anything from the server shows the call's connection is alive.
     private fun received(c: Call) {
-        c.lastReceived = System.nanoTime()
+        val now = System.nanoTime()
+        c.lastReceived = now
+        c.pool.lastReceived[c.origin] = now
     }
 
-    // Moves the engine's new calls off the connection [c] timed out on. Cronet has no call that closes one
-    // connection, so the engine's CronetEngine is retired: new calls go to a fresh one, which dials its own
-    // connections, and the old one shuts down once the calls still on it end. Calls that time out together on the same
-    // dead connection retire it once.
+    // The call has hit its deadline and Dart has already failed it. The server enforces the same deadline and answers
+    // about a round trip later, so the stream stays open for the grace period: an answer, or anything else from the
+    // origin, shows the connection is alive. After it, the stream is canceled, and the connection evicted if it stayed
+    // quiet.
+    private fun cancelAfterDeadline(c: Call, graceMs: Long) {
+        val check = Runnable {
+            try {
+                // Gone: the server's answer ended it, or Cronet failed it.
+                if (calls[c.callId] === c) {
+                    evict(c)
+                    c.stream.cancel()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "call ${c.callId} failed in the bridge", e)
+                abort(c.callId, e)
+            }
+        }
+        executor.schedule(check, graceMs, TimeUnit.MILLISECONDS)
+    }
+
+    // A call that ran out of time (its read-idle timeout, or its deadline and grace) may be stuck on a dead connection.
+    // It is taken to be if nothing has arrived from the call's origin, on any call, since the call last received
+    // anything; otherwise only that call was slow. Cronet has no call that closes one connection, so the engine's
+    // CronetEngine is retired: new calls go to a fresh one, which dials its own connections, and the old one shuts down
+    // once the calls still on it end. Calls that time out together on the same dead connection retire it once.
     private fun evict(c: Call) {
         val engine = engines[c.engineId] ?: return
         if (engine.current !== c.pool || engine.shuttingDown) {
+            return
+        }
+        val heard = c.pool.lastReceived[c.origin]
+        if (heard != null && heard - c.lastReceived > 0) {
             return
         }
         val fresh = try {
@@ -263,7 +319,7 @@ class CronetBridge(
         }
         engine.retired.add(engine.current)
         engine.current = fresh
-        Log.i(TAG, "engine ${c.engineId}: call ${c.callId} hit its read idle timeout; new calls use a fresh CronetEngine")
+        Log.i(TAG, "engine ${c.engineId}: call ${c.callId} ran out of time on a quiet connection; moved to a new engine")
     }
 
     // Fails a call the bridge itself could not carry on with, after an exception on its thread.

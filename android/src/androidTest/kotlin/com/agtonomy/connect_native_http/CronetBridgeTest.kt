@@ -130,6 +130,20 @@ class CronetBridgeTest {
         assertEquals("done", awaitOutcome(1)["type"])
     }
 
+    // After a deadline the stream stays open for the grace period, for a sign that its connection is alive.
+    @Test
+    fun aDeadlineCancelWaitsOutTheGracePeriod() {
+        val engine = createEngine()
+        open(engine, 1, CONVERSE, "application/connect+proto")
+        await(1, "data")
+        val start = System.nanoTime()
+        invoke("cancel", mapOf("callId" to 1, "deadlineGraceMs" to 500))
+        assertEquals("canceled", awaitOutcome(1)["type"])
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
+        assertTrue("canceled after $elapsedMs ms, before the 500 ms grace period", elapsedMs >= 450)
+        assertSayWorks(engine, 2)
+    }
+
     @Test
     fun malformedArgumentsAreRefusedInsteadOfCrashing() {
         val engine = createEngine()
@@ -142,6 +156,8 @@ class CronetBridgeTest {
             "shutdownEngine" to mapOf("engineId" to 1.5),
             "open" to openArguments(engine, 1, SAY, "application/proto") + ("readIdleTimeoutMs" to 0),
             "open" to openArguments(engine, 1, SAY, "application/proto") + ("readIdleTimeoutMs" to "soon"),
+            "cancel" to mapOf("callId" to 1, "deadlineGraceMs" to 0),
+            "cancel" to mapOf("callId" to 1, "deadlineGraceMs" to "soon"),
         )
         for ((method, arguments) in malformed) {
             val reply = reply(method, arguments)

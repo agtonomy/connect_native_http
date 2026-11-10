@@ -67,7 +67,13 @@ final class Harness {
   /// `X-Proto` of each response: the protocol the server saw.
   final serverProtocols = <String>[];
 
-  void recordHeaders(Headers headers) => serverProtocols.add(headers.get('x-proto')?.join(',') ?? '');
+  /// `X-Remote-Addr` of each response: the client's address as the server saw it, which differs between connections.
+  final remoteAddrs = <String>[];
+
+  void recordHeaders(Headers headers) {
+    serverProtocols.add(headers.get('x-proto')?.join(',') ?? '');
+    remoteAddrs.add(headers.get('x-remote-addr')?.join(',') ?? '');
+  }
 }
 
 /// Every case finishes in a few seconds against a local server (most well under one); a hang should fail fast.
@@ -395,13 +401,15 @@ void main() {
     await requests.close();
   }, timeout: http2CaseTimeout);
 
-  testCase('without a read-idle timeout, a dead HTTP/2 connection goes unnoticed', (_) async {
-    // The control for the next case: what the read-idle timeout is for.
+  testCase('a dead HTTP/2 connection is reused until a call runs out of time on it', (_) async {
+    // Nothing notices the dead connection by itself; the first call to run out of time, here on its deadline, moves
+    // the client off it.
     if (skipUnlessAdmin()) {
       return;
     }
     final h2 = await harnessOverHttp2();
     final (requests, responses) = await openQuietConverse(h2);
+    final deadAddr = h2.remoteAddrs.last;
     await admin('/freeze?for=60s&path=tcp');
 
     requests.add(ConverseRequest(sentence: 'anyone?'));
@@ -412,8 +420,34 @@ void main() {
       h2.eliza.say(SayRequest(sentence: 'hi'), signal: TimeoutSignal(const Duration(seconds: 2))),
       throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
     );
+    // Nothing arrives in the grace period after the deadline, so the next call dials a new connection.
+    await Future<void>.delayed(const Duration(milliseconds: 1500));
+    final res = await h2.eliza.say(
+      SayRequest(sentence: 'after'),
+      signal: TimeoutSignal(const Duration(seconds: 8)),
+      onHeader: h2.recordHeaders,
+    );
+    expect(res.sentence, 'say: after');
+    expect(h2.remoteAddrs.last, isNot(deadAddr));
     unawaited(reply.then((_) {}, onError: (_) {}));
     await requests.close();
+  }, timeout: http2CaseTimeout);
+
+  testCase('a deadline the server answers keeps the connection', (_) async {
+    // connect-dart sends the deadline, and the server answers deadline_exceeded about a round trip after the client's
+    // own deadline, within the grace period: the connection is alive.
+    if (skipUnlessAdmin()) {
+      return;
+    }
+    final h2 = await harnessOverHttp2();
+    final liveAddr = h2.remoteAddrs.last;
+    await expectLater(
+      h2.eliza.say(SayRequest(sentence: 'sleep:5000'), signal: TimeoutSignal(const Duration(seconds: 1))),
+      throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 1500));
+    await h2.eliza.say(SayRequest(sentence: 'after'), onHeader: h2.recordHeaders);
+    expect(h2.remoteAddrs.last, liveAddr);
   }, timeout: http2CaseTimeout);
 
   testCase('a read-idle timeout notices a dead HTTP/2 connection, and the next call dials a new one', (_) async {
@@ -426,6 +460,7 @@ void main() {
     final (requests, responses) = await openQuietConverse(h2);
     await admin('/freeze?for=60s&path=tcp');
 
+    final deadAddr = h2.remoteAddrs.last;
     requests.add(ConverseRequest(sentence: 'anyone?'));
     final stopwatch = Stopwatch()..start();
     final cause = await nativeCause(responses.moveNext());
@@ -441,6 +476,7 @@ void main() {
     );
     expect(res.sentence, 'say: after');
     expect(h2.serverProtocols.last, 'HTTP/2.0');
+    expect(h2.remoteAddrs.last, isNot(deadAddr));
   }, timeout: http2CaseTimeout);
 
   testCase('a dead HTTP/3 path fails an open stream', (_) async {

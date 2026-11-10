@@ -250,6 +250,32 @@ void main() {
     await expectLater(response, throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.canceled)));
   });
 
+  test('a deadline fails the call at once, and gives the plugin time to check the connection', () async {
+    final signal = TimeoutSignal(const Duration(milliseconds: 10));
+    final response = client.httpClient(request(StreamController<Uint8List>().stream, signal: signal));
+    await settle();
+    final id = plugin.lastCallId;
+    // No canceled event: the call ends without waiting for the plugin.
+    await expectLater(
+      response.timeout(const Duration(seconds: 1)),
+      throwsA(isA<ConnectException>().having((e) => e.code, 'code', Code.deadlineExceeded)),
+    );
+    final cancel = plugin.callsTo('cancel').single.arguments as Map;
+    expect(cancel['callId'], id);
+    expect(cancel['deadlineGraceMs'], 1000);
+    // The plugin's later events for the call change nothing.
+    await plugin.emit({'callId': id, 'type': 'canceled'});
+  });
+
+  test('a signal that is not a deadline cancels at once', () async {
+    final signal = CancelableSignal();
+    unawaited(client.httpClient(request(null, signal: signal)).then((_) {}, onError: (_) {}));
+    await settle();
+    signal.cancel('stop');
+    await settle();
+    expect((plugin.callsTo('cancel').single.arguments as Map).containsKey('deadlineGraceMs'), isFalse);
+  });
+
   test('cancelling the response body cancels the native stream', () async {
     final responseFuture = client.httpClient(request(null));
     await settle();
