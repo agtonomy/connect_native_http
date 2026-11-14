@@ -1,6 +1,6 @@
 import 'package:connect_native_http/connect_native_http.dart';
 import 'package:connect_native_http/src/cronet/cronet_error.dart';
-import 'package:connect_native_http/src/url_session/ns_url_error.dart';
+import 'package:connect_native_http/src/nio_http3/ns_url_error.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

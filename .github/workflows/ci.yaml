@@ -69,13 +69,24 @@ jobs:
         timeout-minutes: 5
         run: go test ./...
 
+  # The core needs no Apple SDK, and swift-nio-http3 needs Swift 6.4 and, on Apple platforms, macOS 27, so it is tested
+  # on Linux.
   swift-core:
-    name: Swift core tests (macOS)
-    runs-on: macos-latest
-    timeout-minutes: 10
+    name: Swift core tests (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.4.2-noble
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
+      # The SwiftPM build of swift-nio-http3 and its dependencies, which takes minutes from cold.
+      - name: Cache SwiftPM build
+        uses: actions/cache@v6
+        timeout-minutes: 5
+        with:
+          path: ios/connect_native_http/.build
+          key: swift-core-${{ hashFiles('ios/connect_native_http/Package.swift') }}
+          restore-keys: swift-core-
       - uses: actions/setup-go@v7
         timeout-minutes: 5
         with:
@@ -96,7 +107,7 @@ jobs:
           cat server.log >&2
           exit 1
       - name: Swift tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: ios/connect_native_http
         env:
           CONNECT_NATIVE_HTTP_CORE_ONLY: "1"

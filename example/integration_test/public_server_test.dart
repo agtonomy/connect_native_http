@@ -17,7 +17,7 @@ import 'package:integration_test/integration_test.dart';
 /// A real ELIZA, such as Connect's demo server.
 const publicElizaUrl = String.fromEnvironment('PUBLIC_ELIZA_URL');
 
-/// What Cronet reports for HTTP/3. URLSession reports nothing, so the check only applies on Android.
+/// What Cronet reports for HTTP/3. iOS reports `h3`, and speaks nothing else.
 const cronetHttp3 = 'quic/1+spdy/3';
 
 void main() {
@@ -40,10 +40,8 @@ void main() {
   });
 
   void expectHttp3() {
-    if (Platform.isAndroid) {
-      expect(protocols, isNotEmpty);
-      expect(protocols, everyElement(cronetHttp3));
-    }
+    expect(protocols, isNotEmpty);
+    expect(protocols, everyElement(Platform.isAndroid ? cronetHttp3 : 'h3'));
   }
 
   testWidgets('unary over HTTP/3', (_) async {
@@ -101,16 +99,16 @@ void main() {
     return (client, requests, responses);
   }
 
-  bool skipUnlessAndroid() {
-    if (publicElizaUrl.isEmpty || !Platform.isAndroid) {
-      markTestSkipped('PUBLIC_ELIZA_URL not set, or not Android: URLSession has no idle timeout setting');
+  bool skipUnlessPublicServer() {
+    if (publicElizaUrl.isEmpty) {
+      markTestSkipped('PUBLIC_ELIZA_URL not set');
       return true;
     }
     return false;
   }
 
   testWidgets('the client QUIC idle timeout ends a quiet connection', (_) async {
-    if (skipUnlessAndroid()) {
+    if (skipUnlessPublicServer()) {
       return;
     }
     final (client, requests, responses) = await quietConverse(quicIdle);
@@ -123,7 +121,7 @@ void main() {
 
   testWidgets('without the setting the same quiet connection survives', (_) async {
     // The control for the previous case: the server keeps a quiet stream open, so the setting is what closed it.
-    if (skipUnlessAndroid()) {
+    if (skipUnlessPublicServer()) {
       return;
     }
     final (client, requests, responses) = await quietConverse(null);
