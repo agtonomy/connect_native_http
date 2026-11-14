@@ -2,20 +2,20 @@ import ConnectNativeHttpCore
 import Flutter
 import Foundation
 
-// Connects a URLSessionBridge to its Flutter channels.
+// Connects an HTTP3Bridge to its Flutter channels.
 public final class ConnectNativeHttpPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
   private var sink: FlutterEventSink?
-  private lazy var bridge = URLSessionBridge { [weak self] event in
+  private lazy var bridge = HTTP3Bridge { [weak self] event in
     let payload = event.mapValues { $0 is Data ? FlutterStandardTypedData(bytes: $0 as! Data) : $0 }
     DispatchQueue.main.async { self?.sink?(payload) }
   }
 
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = ConnectNativeHttpPlugin()
-    let methods = FlutterMethodChannel(name: "connect_native_http/urlsession", binaryMessenger: registrar.messenger())
+    let methods = FlutterMethodChannel(name: "connect_native_http/http3", binaryMessenger: registrar.messenger())
     registrar.addMethodCallDelegate(instance, channel: methods)
     let events = FlutterEventChannel(
-      name: "connect_native_http/urlsession/events", binaryMessenger: registrar.messenger())
+      name: "connect_native_http/http3/events", binaryMessenger: registrar.messenger())
     events.setStreamHandler(instance)
   }
 
