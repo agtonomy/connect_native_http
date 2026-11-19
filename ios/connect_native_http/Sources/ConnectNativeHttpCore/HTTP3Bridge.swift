@@ -607,10 +607,10 @@ public final class HTTP3Bridge: @unchecked Sendable {
     let loop = self.loop
     let created = loop.makeFutureWithTask {
       try await h3.createRequestStream { parameters in
-        // A server that has its answer may stop reading the request (STOP_SENDING, which quic-go sends whenever a
-        // handler returns before reading the whole body). Without this option, that closes the whole stream, response
-        // and all; with it, only the request side.
-        parameters.channel.setOption(.halfCloseOnStopSending, value: true).flatMapThrowing {
+        // swift-nio-http3 sets halfCloseOnStopSending on request streams (apple/swift-nio-http3#104), so a server's
+        // STOP_SENDING, which quic-go sends whenever a handler returns before reading the whole body, closes only the
+        // request side and the response is still read.
+        parameters.channel.eventLoop.makeCompletedFuture {
           try parameters.channel.pipeline.syncOperations.addHandler(handler)
           return (parameters.channel, parameters.streamID)
         }

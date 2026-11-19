@@ -55,7 +55,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.104.0"),
         // swift-nio-http3 has no release yet, so it is pinned to a commit.
-        .package(url: "https://github.com/apple/swift-nio-http3.git", revision: "58ba11baee89b43ca1adeafe6bb976f17c9a86f3"),
+        .package(url: "https://github.com/apple/swift-nio-http3.git", revision: "b794b08960a69bc3337bc4838cc0ceb4332fdea6"),
         .package(url: "https://github.com/apple/swift-nio-quic.git", .upToNextMinor(from: "0.6.0")),
         .package(url: "https://github.com/apple/swift-nio-quic-helpers.git", .upToNextMinor(from: "0.1.2")),
         .package(url: "https://github.com/apple/swift-http-types.git", from: "1.8.0"),

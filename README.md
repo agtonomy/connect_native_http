@@ -135,8 +135,10 @@ URLSession:
   answers with, so without it a server that isn't there would hold calls until their deadlines.
 - **Negotiated protocol.** `NativeHttpResponseInfo.protocol` is `h3`.
 - **Ending bidi calls.** The bridge ends a call on the response's end, so the Connect end-stream detector isn't needed.
-  A server that has its answer typically also stops reading the request (`STOP_SENDING`); the bridge sets
-  swift-nio-quic's `halfCloseOnStopSending` on every request stream, so that closes only the request side.
+  A server that has its answer typically also stops reading the request (`STOP_SENDING`); swift-nio-http3 sets
+  swift-nio-quic's `halfCloseOnStopSending` on every request stream
+  ([apple/swift-nio-http3#104](https://github.com/apple/swift-nio-http3/pull/104)), so that closes only the request
+  side.
 - **No write backpressure.** A write completes once swift-nio-quic has buffered it, so a server that stops reading
   leaves the rest in memory.
 - **Pre-1.0 dependencies.** swift-nio-http3 has no release yet and is pinned to a commit in
