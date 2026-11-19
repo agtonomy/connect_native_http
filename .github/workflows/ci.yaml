@@ -156,7 +156,7 @@ jobs:
             with:
               post-setup-script: flutter config --enable-swift-package-manager
           # Needs neither Go nor Flutter, nor a booted simulator; the native step then finds it up to date.
-          # Cold, building swift-nio-http3 and its dependencies took 6 minutes; cached, well under one.
+          # From cold, building swift-nio-http3 and its dependencies took 6 minutes (run 44430936460).
           - name: Build native bridge tests
             timeout-minutes: 15
             run: ios/connect_native_http/build_core_tests.sh build/ios_core_tests
