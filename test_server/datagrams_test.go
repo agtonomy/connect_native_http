@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,8 +18,10 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-// An Extended CONNECT with :protocol datagram-echo gets 200, and each HTTP datagram comes back unchanged.
-func TestDatagramEcho(t *testing.T) {
+// dialHTTP3 starts the test server's HTTP/3 side and connects a quic-go client to it, which advertises QUIC and HTTP
+// datagram support when datagrams is set.
+func dialHTTP3(t *testing.T, ctx context.Context, datagrams bool) *http3.ClientConn {
+	t.Helper()
 	dir := t.TempDir()
 	cert, err := writeCertificates(dir, []string{"localhost", "127.0.0.1"})
 	if err != nil {
@@ -42,15 +46,21 @@ func TestDatagramEcho(t *testing.T) {
 	go func() { _ = server.Serve(udp) }()
 	t.Cleanup(func() { _ = server.Close() })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	tlsConfig := &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{http3.NextProtoH3}}
-	conn, err := quic.DialAddr(ctx, udp.LocalAddr().String(), tlsConfig, &quic.Config{EnableDatagrams: true})
+	conn, err := quic.DialAddr(ctx, udp.LocalAddr().String(), tlsConfig, &quic.Config{EnableDatagrams: datagrams})
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport := &http3.Transport{EnableDatagrams: true}
-	client := transport.NewClientConn(conn)
+	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	transport := &http3.Transport{EnableDatagrams: datagrams}
+	return transport.NewClientConn(conn)
+}
+
+// An Extended CONNECT with :protocol datagram-echo gets 200, and each HTTP datagram comes back unchanged.
+func TestDatagramEcho(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := dialHTTP3(t, ctx, true)
 	select {
 	case <-client.ReceivedSettings():
 	case <-ctx.Done():
@@ -95,5 +105,36 @@ func TestDatagramEcho(t *testing.T) {
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// /client-settings reports whether the client advertised QUIC and HTTP datagram support.
+func TestClientSettings(t *testing.T) {
+	for _, datagrams := range []bool{false, true} {
+		t.Run(fmt.Sprintf("datagrams=%v", datagrams), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client := dialHTTP3(t, ctx, datagrams)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://localhost/client-settings", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := client.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("status %d, want 200", res.StatusCode)
+			}
+			var got clientSettings
+			if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			want := clientSettings{H3Datagram: datagrams, QUICDatagrams: datagrams}
+			if got != want {
+				t.Fatalf("got %+v, want %+v", got, want)
+			}
+		})
 	}
 }

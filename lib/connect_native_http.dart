@@ -1,4 +1,5 @@
-/// connect-dart HttpClients over HTTP/3, with HTTP datagram sessions on iOS: swift-nio-http3 on iOS, Cronet on Android.
+/// connect-dart HttpClients on the platform HTTP stacks: URLSession on iOS, Cronet on Android. On iOS 27 and later,
+/// `NativeHttpConfig.enableDatagrams` switches to swift-nio-http3, which adds HTTP/3 datagram sessions.
 library;
 
 export 'src/datagram_session.dart' show DatagramSession, DatagramSessionRejected;

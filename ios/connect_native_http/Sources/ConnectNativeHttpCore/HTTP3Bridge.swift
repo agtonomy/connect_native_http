@@ -10,19 +10,22 @@ import NIOQUIC
 import NIOQUICHelpers
 import X509
 
-// Bridges swift-nio-http3 to lib/src/nio_http3/nio_http3_client.dart, one HTTP/3 request stream per call,
-// with the same channel protocol as the Android bridge. Dart sends request chunks as method calls; response headers,
-// body chunks and the outcome go to `emit`. Kept free of Flutter so it can be tested without a Flutter app, on macOS
-// or Linux.
+// Bridges swift-nio-http3 to lib/src/nio_http3/nio_http3_client.dart, one HTTP/3 request stream per call, with the
+// same channel protocol as the URLSession and Android bridges. Dart sends request chunks as method calls; response
+// headers, body chunks and the outcome go to `emit`. Kept free of Flutter so it can be tested without a Flutter app, on
+// macOS or Linux.
 //
-// Datagram sessions add to that protocol: `openDatagrams` opens an Extended CONNECT (RFC 9220) request stream, and
-// `sendDatagram` sends an HTTP datagram (RFC 9297) on it. Datagrams from the server arrive as `datagram` events. The
-// session is otherwise a call like any other: `headers` with the server's answer, `data` with anything it writes on
-// the stream, `end` and `cancel` to close it, and `done`, `failed` or `canceled` when it ends.
+// Datagram sessions add to that protocol, on engines created with `datagrams`: `openDatagrams` opens an Extended
+// CONNECT (RFC 9220) request stream, and `sendDatagram` sends an HTTP datagram (RFC 9297) on it. Datagrams from the
+// server arrive as `datagram` events. The session is otherwise a call like any other: `headers` with the server's
+// answer, `data` with anything it writes on the stream, `end` and `cancel` to close it, and `done`, `failed` or
+// `canceled` when it ends.
 //
-// Failures are reported in `NSURLErrorDomain` codes, which lib/src/nio_http3/ns_url_error.dart already classifies.
+// Failures are reported in `NSURLErrorDomain` codes, as URLSessionBridge reports them, which
+// lib/src/url_session/ns_url_error.dart already classifies.
 //
 // Everything runs on one event loop, `loop`: the bridge's state, and every channel of every connection.
+@available(anyAppleOS 27, *)
 public final class HTTP3Bridge: @unchecked Sendable {
   public enum Reply {
     case success(Any?)
@@ -101,11 +104,14 @@ public final class HTTP3Bridge: @unchecked Sendable {
       guard origins.allSatisfy({ $0.count == 2 }) else { throw BadArgument(name: "http3Origins") }
       let quicIdleTimeoutMs = try optionalPositiveInt(args, "quicIdleTimeoutMs")
       let connectTimeoutMs = try optionalPositiveInt(args, "connectTimeoutMs")
+      let datagrams = args["datagrams"] ?? false
+      guard let datagrams = datagrams as? Bool else { throw BadArgument(name: "datagrams") }
       loop.execute {
         let id = self.nextEngineId
         self.nextEngineId += 1
         self.engines[id] = Engine(
-          id: id, quicIdleTimeoutMs: quicIdleTimeoutMs, connectTimeout: connectTimeoutMs.map { .milliseconds(Int64($0)) })
+          id: id, quicIdleTimeoutMs: quicIdleTimeoutMs,
+          connectTimeout: connectTimeoutMs.map { .milliseconds(Int64($0)) }, datagrams: datagrams)
         reply(.success(id))
       }
     case "shutdownEngine":
@@ -186,13 +192,17 @@ public final class HTTP3Bridge: @unchecked Sendable {
     let id: Int
     let quicIdleTimeoutMs: Int?
     let connectTimeout: TimeAmount?
+    /// Whether this engine's connections advertise datagram support: QUIC's `max_datagram_frame_size` transport
+    /// parameter (RFC 9221) and HTTP/3's `SETTINGS_H3_DATAGRAM` (RFC 9297). Only such engines open datagram sessions.
+    let datagrams: Bool
     // The connection new calls to each origin ("host:port") go to.
     var connections: [String: Connection] = [:]
 
-    init(id: Int, quicIdleTimeoutMs: Int?, connectTimeout: TimeAmount?) {
+    init(id: Int, quicIdleTimeoutMs: Int?, connectTimeout: TimeAmount?, datagrams: Bool) {
       self.id = id
       self.quicIdleTimeoutMs = quicIdleTimeoutMs
       self.connectTimeout = connectTimeout
+      self.datagrams = datagrams
     }
   }
 
@@ -233,7 +243,7 @@ public final class HTTP3Bridge: @unchecked Sendable {
     }
     let connection = Connection(origin: origin, host: host, port: port, loop: loop)
     engine.connections[origin] = connection
-    connect(connection, quicIdleTimeoutMs: engine.quicIdleTimeoutMs)
+    connect(connection, engine: engine)
     let timeout = engine.connectTimeout ?? connectTimeout
     loop.scheduleTask(in: timeout) {
       if !connection.isReady && !connection.closed {
@@ -243,7 +253,7 @@ public final class HTTP3Bridge: @unchecked Sendable {
     return connection
   }
 
-  private func connect(_ connection: Connection, quicIdleTimeoutMs: Int?) {
+  private func connect(_ connection: Connection, engine: Engine) {
     let loop = self.loop
     let host = connection.host
     let port = connection.port
@@ -256,7 +266,7 @@ public final class HTTP3Bridge: @unchecked Sendable {
     }
     resolved.whenSuccess { address in
       do {
-        try self.dial(connection, address: address, quicIdleTimeoutMs: quicIdleTimeoutMs)
+        try self.dial(connection, address: address, engine: engine)
       } catch {
         self.connectionFailed(connection, ConnectError.connect(error))
       }
@@ -269,19 +279,22 @@ public final class HTTP3Bridge: @unchecked Sendable {
     case timedOut(TimeAmount)
   }
 
-  private func quicConfiguration(quicIdleTimeoutMs: Int?) -> QUICConfiguration {
+  private func quicConfiguration(for engine: Engine) -> QUICConfiguration {
     var configuration = QUICConfiguration.forClient(
       verificationConfiguration: .x509Certificates(trustRootsFilePath: nil),
       applicationProtocols: ["h3"]
     )
-    if let ms = quicIdleTimeoutMs {
+    if let ms = engine.quicIdleTimeoutMs {
       configuration.maxIdleTimeout = .milliseconds(ms)
     }
+    // swift-nio-quic advertises 65535, the largest frame RFC 9221 allows, unless told otherwise; 0 advertises none.
+    configuration.maxDatagramFrameSize = engine.datagrams ? 65535 : 0
     return configuration
   }
 
-  private func dial(_ connection: Connection, address: SocketAddress, quicIdleTimeoutMs: Int?) throws {
-    let configuration = quicConfiguration(quicIdleTimeoutMs: quicIdleTimeoutMs)
+  private func dial(_ connection: Connection, address: SocketAddress, engine: Engine) throws {
+    let configuration = quicConfiguration(for: engine)
+    let datagrams = engine.datagrams
     let verifier =
       if let trustRoots {
         try AsyncVerifier(trustRoots: trustRoots, eventLoop: loop)
@@ -321,7 +334,7 @@ public final class HTTP3Bridge: @unchecked Sendable {
             udp.close(promise: nil)
             return
           }
-          self.handshake(connection, udp: udp, serverName: serverName, address: address)
+          self.handshake(connection, udp: udp, serverName: serverName, address: address, datagrams: datagrams)
         }
       }
   }
@@ -333,7 +346,9 @@ public final class HTTP3Bridge: @unchecked Sendable {
     ).flatMap { $0.inboundStreamReceived(stream) }
   }
 
-  private func handshake(_ connection: Connection, udp: any Channel, serverName: String, address: SocketAddress) {
+  private func handshake(
+    _ connection: Connection, udp: any Channel, serverName: String, address: SocketAddress, datagrams: Bool
+  ) {
     let logger = self.logger
     let handler = ConnectionHandler(bridge: self, connection: connection)
     let quic: QUICHandler<QUICStreamChannels>
@@ -350,7 +365,7 @@ public final class HTTP3Bridge: @unchecked Sendable {
         channel.eventLoop.makeCompletedFuture {
           let h3: HTTP3ClientConnection<Void, NIOQUIC.QUICStreamCreator> = try channel.pipeline.syncOperations
             .configureAsyncHTTP3ClientPipeline(
-              settings: HTTP3Settings(h3Datagram: true),
+              settings: HTTP3Settings(h3Datagram: datagrams),
               streamCreator: streamCreator,
               logger: logger,
               inboundPushStreamInitializer: { _ in }
@@ -516,6 +531,12 @@ public final class HTTP3Bridge: @unchecked Sendable {
     else {
       emit(failure(
         callId, domain: "ConnectNativeHttp", code: 0, message: "engine \(engineId) is shut down or \(url) is invalid"))
+      return
+    }
+    if case .datagrams = kind, !engine.datagrams {
+      emit(failure(
+        callId, domain: "ConnectNativeHttp", code: -2,
+        message: "engine \(engineId) was created without datagrams, so it advertises no datagram support"))
       return
     }
     guard components.scheme?.lowercased() == "https" else {
@@ -826,6 +847,7 @@ let NSURLErrorDomainName = "NSURLErrorDomain"
 // MARK: Channel handlers
 
 /// On a connection channel, after its HTTP/3 handler: routes the connection's datagrams and SETTINGS to the bridge.
+@available(anyAppleOS 27, *)
 private final class ConnectionHandler: ChannelInboundHandler, @unchecked Sendable {
   typealias InboundIn = HTTP3Datagram
 
@@ -855,6 +877,7 @@ private final class ConnectionHandler: ChannelInboundHandler, @unchecked Sendabl
 }
 
 /// On a request stream channel: hands the response to the bridge.
+@available(anyAppleOS 27, *)
 private final class StreamHandler: ChannelInboundHandler, @unchecked Sendable {
   typealias InboundIn = HTTPResponsePart
   typealias OutboundOut = HTTPRequestPart

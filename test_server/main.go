@@ -130,6 +130,8 @@ func newHTTP3Server(handler http.Handler, tlsConfig *tls.Config, quicConfig *qui
 		QUICConfig: quicConfig,
 		// HTTP datagrams (RFC 9297), for datagramEcho. quic-go's server always offers Extended CONNECT.
 		EnableDatagrams: true,
+		// For clientSettingsHandler.
+		ConnContext: withQUICConn,
 	}
 }
 
@@ -139,6 +141,7 @@ func newElizaMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	connecthttp.Mount(mux, server)
 	mux.HandleFunc("/datagrams/echo", datagramEcho)
+	mux.HandleFunc("/client-settings", clientSettingsHandler)
 	// A 307 makes a client send the same request body again, to the path after /redirect. The body is read first:
 	// answering without it resets the request stream, and the client fails on that instead of the redirect.
 	mux.HandleFunc("/redirect/", func(w http.ResponseWriter, r *http.Request) {

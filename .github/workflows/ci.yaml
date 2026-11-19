@@ -69,8 +69,8 @@ jobs:
         timeout-minutes: 5
         run: go test ./...
 
-  # The core needs no Apple SDK, and swift-nio-http3 needs Swift 6.4 and, on Apple platforms, macOS 27, so it is tested
-  # on Linux.
+  # HTTP3Bridge needs no Apple SDK, so its tests also run on Linux, where they don't wait for the simulator.
+  # URLSessionBridge is Apple-only and runs in the iOS job.
   swift-core:
     name: Swift core tests (Linux)
     runs-on: ubuntu-latest
@@ -96,7 +96,8 @@ jobs:
         timeout-minutes: 5
         run: |
           cd test_server
-          go build -o connect-native-http-test-server .
+          # No VCS stamp: git refuses the checkout inside the container, whose owner differs from the container's user.
+          go build -buildvcs=false -o connect-native-http-test-server .
           ./connect-native-http-test-server -addr :8443 -hosts localhost -certdir certs -admin-addr :8081 \
             > server.log 2>&1 &
           for _ in $(seq 100); do
@@ -124,7 +125,8 @@ jobs:
 
   ios-integration:
     name: iOS integration tests (simulator)
-    runs-on: macos-latest
+    # swift-nio-http3 needs Swift 6.4, which Xcode 26 doesn't have, and its HTTP/3 bridge needs an iOS 27 simulator.
+    runs-on: xcode-27
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -139,8 +141,8 @@ jobs:
             ~/Library/Developer/Xcode/DerivedData
             example/build/ios
             build/ios_core_tests
-          key: ios-builds-${{ hashFiles('.fvmrc', 'pubspec.yaml', 'lib/**', 'ios/**', 'example/pubspec.yaml', 'example/lib/**', 'example/ios/**', 'example/integration_test/**') }}
-          restore-keys: ios-builds-
+          key: ios-builds-xcode-27-${{ hashFiles('.fvmrc', 'pubspec.yaml', 'lib/**', 'ios/**', 'example/pubspec.yaml', 'example/lib/**', 'example/ios/**', 'example/integration_test/**') }}
+          restore-keys: ios-builds-xcode-27-
       - parallel:
           - uses: actions/setup-go@v7
             timeout-minutes: 5

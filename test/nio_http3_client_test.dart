@@ -60,7 +60,9 @@ void main() {
 
   setUp(() async {
     plugin = FakeHttp3Plugin();
-    client = await NioHttp3Client.create(const NativeHttpConfig(quicIdleTimeout: Duration(milliseconds: 1500)));
+    client = await NioHttp3Client.create(
+      const NativeHttpConfig(enableDatagrams: true, quicIdleTimeout: Duration(milliseconds: 1500)),
+    );
   });
 
   /// Opens a session and lets the fake server accept it with [status].

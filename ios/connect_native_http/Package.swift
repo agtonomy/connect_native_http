@@ -6,7 +6,9 @@ import PackageDescription
 // and its tests also build on their own, without it, on macOS or Linux:
 //   CONNECT_NATIVE_HTTP_CORE_ONLY=1 swift test
 //
-// swift-nio-http3 and swift-nio-quic need Swift 6.4 and, on Apple platforms, iOS or macOS 27.
+// URLSessionBridge, the default on iOS, runs on iOS 15. HTTP3Bridge, which NativeHttpConfig.enableDatagrams selects,
+// runs on iOS or macOS 27, as swift-nio-http3 and swift-nio-quic do. Those libraries need Swift 6.4 to build, so the
+// package does too, whichever bridge an app uses.
 let coreOnly = Context.environment["CONNECT_NATIVE_HTTP_CORE_ONLY"] != nil
 
 let core = Target.target(
@@ -30,7 +32,8 @@ let coreTests = Target.testTarget(
     dependencies: [
         "ConnectNativeHttpCore",
         .product(name: "X509", package: "swift-certificates"),
-    ]
+    ],
+    swiftSettings: [.enableExperimentalFeature("AnyAppleOSAvailability")]
 )
 let plugin = Target.target(
     name: "connect_native_http",
@@ -43,8 +46,8 @@ let plugin = Target.target(
 let package = Package(
     name: "connect_native_http",
     platforms: [
-        .iOS("27.0"),
-        .macOS("27.0"),
+        .iOS("15.0"),
+        .macOS("12.0"),
     ],
     products: coreOnly ? [] : [
         .library(name: "connect-native-http", targets: ["connect_native_http"])

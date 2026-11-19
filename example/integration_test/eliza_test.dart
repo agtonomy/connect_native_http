@@ -1,6 +1,7 @@
 // Runs connect_native_http's platform client against ../test_server on a device or simulator. Start it through
 // ../run_integration_tests.sh, which starts the server, trusts its CA on the device and passes these defines.
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' as io;
 
 import 'package:connect_native_http/connect_native_http.dart';
@@ -42,9 +43,9 @@ final class Harness {
     String baseUrl, {
     Set<Uri> http3Origins = const {},
     Duration? readIdleTimeout,
-    Duration? connectTimeout,
     Duration? deadlineStep,
     bool evictOnDeadline = false,
+    bool enableDatagrams = false,
     bool useHttpGet = false,
   }) async {
     late final Harness harness;
@@ -52,9 +53,9 @@ final class Harness {
       NativeHttpConfig(
         http3Origins: http3Origins,
         readIdleTimeout: readIdleTimeout,
-        connectTimeout: connectTimeout,
         deadlineStep: deadlineStep,
         evictOnDeadline: evictOnDeadline,
+        enableDatagrams: enableDatagrams,
         onResponse: (info) => harness.platformProtocols.add(info.protocol),
       ),
     );
@@ -114,10 +115,10 @@ Future<(StreamController<ConverseRequest>, StreamIterator<ConverseResponse>)> op
 
 /// A client whose pooled connection to the server negotiated [protocol], such as `HTTP/3.0`.
 ///
-/// iOS only speaks HTTP/3, so its first attempt gets it. Cronet may race QUIC against TCP for a new connection and
-/// keep whichever connects first, and a client keeps reusing the connection it has, so each attempt uses a fresh
-/// client, closing the ones that got another protocol. Each attempt is that client's first call, before any Alt-Svc:
-/// reaching HTTP/3 shows the client tried QUIC because of http3Origins.
+/// URLSession races QUIC against TCP for each new connection and keeps whichever connects first, so on a loaded
+/// device a connection sometimes lands on HTTP/2 even for an HTTP/3 origin. A client keeps reusing the connection it
+/// has, so each attempt uses a fresh client, closing the ones that got another protocol. Each attempt is that
+/// client's first call, before any Alt-Svc: reaching HTTP/3 shows the client tried QUIC because of http3Origins.
 Future<Harness> harnessNegotiating(String protocol) async {
   final deadline = DateTime.now().add(const Duration(seconds: 5));
   final protocols = <String>[];
@@ -141,8 +142,8 @@ Future<Harness> harnessNegotiating(String protocol) async {
   }
 }
 
-/// A client on HTTP/2, with the server's UDP frozen for the rest of the case so that QUIC can't connect, as on a
-/// network that blocks UDP. Android is on HTTP/2 with this server anyway. Not on iOS, which has no HTTP/2.
+/// A client on HTTP/2, with the server's UDP frozen for the rest of the case so that QUIC can't connect: URLSession
+/// then falls back to TCP, as on a network that blocks UDP. Android is on HTTP/2 with this server anyway.
 Future<Harness> harnessOverHttp2({
   Duration? readIdleTimeout,
   Duration? deadlineStep,
@@ -189,8 +190,8 @@ void main() {
 
   // One call on a throwaway client before any case. Right after the app launches, the simulator and the test server
   // on the same CI runner are both slow (a QUIC connection took 66 ms to set up, and the server answered its first
-  // packet 130 ms after it was sent). The cases then start on a warm app and server. The protocol it got is logged,
-  // not checked.
+  // packet 130 ms after it was sent), so the first call's QUIC attempt loses URLSession's race to TCP. The cases then
+  // start on a warm app and server. The protocol it got is logged, not checked.
   //
   // A few attempts, each on a fresh client whose call a deadline cancels: on a freshly booted simulator, trustd can
   // stall every certificate check for a while (once while it updated its pinning database from a trust data update).
@@ -313,26 +314,19 @@ void main() {
 
   testCase('a refused connection is reported as never sent', (_) async {
     expect(unreachableUrl, isNotEmpty, reason: 'run with --dart-define=UNREACHABLE_URL=...');
-    // QUIC ignores the ICMP error a closed UDP port answers with, so on iOS only the connect timeout notices.
-    final unreachable = await Harness.create(unreachableUrl, connectTimeout: const Duration(seconds: 3));
+    final unreachable = await Harness.create(unreachableUrl);
     addTearDown(unreachable.native.close);
     final cause = await nativeCause(unreachable.eliza.say(SayRequest(sentence: 'hi')));
     expect(cause.failure, NativeHttpFailure.notSent, reason: '$cause');
     expect(cause.requestNeverSent, isTrue);
   });
 
-  testCase('a certificate for another name is rejected, and the request never sent', (_) async {
+  testCase('a certificate for another name is rejected as untrusted', (_) async {
     expect(untrustedUrl, isNotEmpty, reason: 'run with --dart-define=UNTRUSTED_URL=...');
     final untrusted = await Harness.create(untrustedUrl);
     addTearDown(untrusted.native.close);
     final cause = await nativeCause(untrusted.eliza.say(SayRequest(sentence: 'hi')));
-    // The QUIC stack on iOS reports every failed TLS handshake alike: NSURLErrorSecureConnectionFailed (-1200).
-    expect(
-      cause.failure,
-      io.Platform.isIOS ? NativeHttpFailure.notSent : NativeHttpFailure.untrusted,
-      reason: '$cause',
-    );
-    expect(cause.requestNeverSent, isTrue);
+    expect(cause.failure, NativeHttpFailure.untrusted, reason: '$cause');
   });
 
   testCase('negotiates the expected protocol', (_) async {
@@ -389,13 +383,8 @@ void main() {
     expect(h3.serverProtocols.last, 'HTTP/3.0');
   }, timeout: http3CaseTimeout);
 
-  // Over HTTP/2 Cronet doesn't notice a dead connection (no pings), so a read-idle timeout is what does. iOS has no
-  // HTTP/2.
+  // Over HTTP/2 neither platform notices a dead connection (no pings), so a read-idle timeout is what does.
   bool skipUnlessAdmin() {
-    if (io.Platform.isIOS) {
-      markTestSkipped('iOS speaks HTTP/3 only');
-      return true;
-    }
     if (adminUrl.isEmpty) {
       markTestSkipped('needs ADMIN_URL');
       return true;
@@ -572,13 +561,45 @@ void main() {
     await requests.close();
   }, timeout: http3CaseTimeout);
 
-  testCase('a datagram session echoes datagrams', (_) async {
+  // Datagram sessions need NativeHttpConfig.enableDatagrams, which on iOS swaps URLSession for swift-nio-http3.
+
+  testCase('a client without enableDatagrams opens no datagram sessions', (_) async {
+    final url = Uri.parse('$serverUrl/datagrams/echo');
+    expect(() => harness.native.openDatagramSession(url, protocol: 'datagram-echo'), throwsUnsupportedError);
+  });
+
+  testCase('with enableDatagrams, calls go over HTTP/3 and the client advertises datagram support', (_) async {
+    final datagrams = await Harness.create(serverUrl, enableDatagrams: true);
+    addTearDown(datagrams.native.close);
     final url = Uri.parse('$serverUrl/datagrams/echo');
     if (!io.Platform.isIOS) {
-      expect(() => harness.native.openDatagramSession(url, protocol: 'datagram-echo'), throwsUnsupportedError);
+      // Cronet has no datagrams; the option changes nothing there.
+      expect(() => datagrams.native.openDatagramSession(url, protocol: 'datagram-echo'), throwsUnsupportedError);
       return;
     }
-    final session = await harness.native.openDatagramSession(url, protocol: 'datagram-echo');
+    final res = await datagrams.eliza.say(SayRequest(sentence: 'hi'), onHeader: datagrams.recordHeaders);
+    expect(res.sentence, 'say: hi');
+    expect(datagrams.serverProtocols.last, 'HTTP/3.0');
+    expect(datagrams.platformProtocols.last, 'h3');
+
+    // What the server saw of the client's QUIC transport parameters and HTTP/3 SETTINGS (test_server/client_settings.go).
+    final response = await datagrams.native.httpClient(
+      HttpRequest('$serverUrl/client-settings', 'GET', Headers(), null, null),
+    );
+    expect(response.status, 200);
+    final body = utf8.decode(await response.body.expand((chunk) => chunk).toList());
+    expect(jsonDecode(body), {'h3Datagram': true, 'quicDatagrams': true});
+  });
+
+  testCase('with enableDatagrams, a datagram session echoes datagrams', (_) async {
+    if (!io.Platform.isIOS) {
+      markTestSkipped('Cronet has no datagram sessions');
+      return;
+    }
+    final datagrams = await Harness.create(serverUrl, enableDatagrams: true);
+    addTearDown(datagrams.native.close);
+    final url = Uri.parse('$serverUrl/datagrams/echo');
+    final session = await datagrams.native.openDatagramSession(url, protocol: 'datagram-echo');
     expect(session.status, 200);
     final echoes = StreamIterator(session.datagrams);
     // Datagrams may be lost, even locally; resend until each comes back.

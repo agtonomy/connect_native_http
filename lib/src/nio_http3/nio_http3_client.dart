@@ -3,7 +3,7 @@ import 'package:flutter/services.dart';
 import '../channel/channel_http_client.dart';
 import '../native_http_config.dart';
 import '../native_http_exception.dart';
-import 'ns_url_error.dart';
+import '../url_session/ns_url_error.dart';
 
 /// Must match `ios/.../ConnectNativeHttpPlugin.swift`.
 const nioHttp3MethodChannel = MethodChannel('connect_native_http/http3');
@@ -27,7 +27,9 @@ NativeHttpException _nioHttp3Failure(Map<String, Object?> event) {
   );
 }
 
-/// A connect-dart [HttpClient] on swift-nio-http3, driven by the Swift plugin in `ios/`. Every call goes over HTTP/3.
+/// A connect-dart [HttpClient] on swift-nio-http3, driven by the Swift plugin in `ios/`, for
+/// [NativeHttpConfig.enableDatagrams]. Every call goes over HTTP/3, and the client advertises datagram support when the
+/// config enables it.
 final class NioHttp3Client extends ChannelHttpClient {
   NioHttp3Client._(int engineId, NativeHttpConfig config) : super(nioHttp3Bridge, engineId, config);
 
@@ -46,6 +48,7 @@ final class NioHttp3Client extends ChannelHttpClient {
       ],
       'quicIdleTimeoutMs': idle == null ? null : (idle.inMicroseconds / 1000).ceil(),
       'connectTimeoutMs': connect == null ? null : (connect.inMicroseconds / 1000).ceil(),
+      'datagrams': config.enableDatagrams,
     });
     return NioHttp3Client._(engineId, config);
   }

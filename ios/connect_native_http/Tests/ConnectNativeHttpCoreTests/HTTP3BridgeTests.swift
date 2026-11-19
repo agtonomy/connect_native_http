@@ -8,12 +8,15 @@ import XCTest
   import FoundationNetworking
 #endif
 
-// Bridge behavior the Dart integration tests can't reach, on macOS or Linux,, against test_server/. run_integration_tests.sh starts the
-// server and passes its URL as SERVER_URL and its CA certificate (DER) as SERVER_CA.
+// Bridge behavior the Dart integration tests can't reach, on macOS or Linux, against test_server/.
+// run_integration_tests.sh starts the server and passes its URL as SERVER_URL and its CA certificate (DER) as
+// SERVER_CA.
+@available(anyAppleOS 27, *)
 final class HTTP3BridgeTests: XCTestCase {
   private static let converse = "/connectrpc.eliza.v1.ElizaService/Converse"
   private static let say = "/connectrpc.eliza.v1.ElizaService/Say"
   private static let datagramEcho = "/datagrams/echo"
+  private static let clientSettings = "/client-settings"
 
   private var serverURL = ""
   private var bridge: HTTP3Bridge!
@@ -143,6 +146,7 @@ final class HTTP3BridgeTests: XCTestCase {
       ("createEngine", ["http3Origins": [["localhost"]]]),
       ("createEngine", ["quicIdleTimeoutMs": "soon"]),
       ("createEngine", ["connectTimeoutMs": 0]),
+      ("createEngine", ["datagrams": "yes"]),
       ("openDatagrams", ["engineId": 1, "callId": 1, "url": serverURL, "headers": [[String]]()]),
       ("openDatagrams", ["engineId": 1, "callId": 1, "url": serverURL, "protocol": 1, "headers": [[String]]()]),
       ("sendDatagram", ["callId": 1]),
@@ -258,7 +262,7 @@ final class HTTP3BridgeTests: XCTestCase {
   // MARK: Datagram sessions
 
   func testDatagramsEchoOnAnExtendedConnectSession() async throws {
-    let engine = try await createEngine()
+    let engine = try await createEngine(datagrams: true)
     try await openDatagrams(engine, callId: 1)
     try await waitUntil("the session was accepted", timeout: 10) { self.event(1, "headers") != nil }
     XCTAssertEqual(event(1, "headers")?["status"] as? Int, 200)
@@ -278,7 +282,7 @@ final class HTTP3BridgeTests: XCTestCase {
   }
 
   func testDatagramsCanBeSentBeforeTheServerAnswers() async throws {
-    let engine = try await createEngine()
+    let engine = try await createEngine(datagrams: true)
     try await openDatagrams(engine, callId: 1)
     // The stream exists once the reply to sendDatagram is a success; until then it is refused.
     try await waitUntil("a datagram was taken", timeout: 10) {
@@ -291,7 +295,7 @@ final class HTTP3BridgeTests: XCTestCase {
   }
 
   func testTheServerEndsADatagramSession() async throws {
-    let engine = try await createEngine()
+    let engine = try await createEngine(datagrams: true)
     try await openDatagrams(engine, callId: 1)
     try await waitUntil("the session was accepted", timeout: 10) { self.event(1, "headers") != nil }
     try await invoke("sendDatagram", ["callId": 1, "data": Data("close".utf8)])
@@ -304,7 +308,7 @@ final class HTTP3BridgeTests: XCTestCase {
   }
 
   func testDatagramSessionsAndCallsShareAConnection() async throws {
-    let engine = try await createEngine()
+    let engine = try await createEngine(datagrams: true)
     try await openDatagrams(engine, callId: 1)
     try await openDatagrams(engine, callId: 2)
     try await open(engine, callId: 3, path: Self.say, contentType: "application/proto")
@@ -329,8 +333,40 @@ final class HTTP3BridgeTests: XCTestCase {
     try await waitUntil("the echo arrived") { self.datagrams(2).contains("still") }
   }
 
-  func testATooLargeDatagramIsRefused() async throws {
+  // MARK: Advertising datagram support
+
+  func testAnEngineWithoutDatagramsAdvertisesNoDatagramSupport() async throws {
     let engine = try await createEngine()
+    let settings = try await advertisedSettings(engine)
+    XCTAssertEqual(settings["h3Datagram"], false, "SETTINGS_H3_DATAGRAM")
+    XCTAssertEqual(settings["quicDatagrams"], false, "max_datagram_frame_size")
+  }
+
+  func testAnEngineWithDatagramsAdvertisesDatagramSupport() async throws {
+    let engine = try await createEngine(datagrams: true)
+    let settings = try await advertisedSettings(engine)
+    XCTAssertEqual(settings["h3Datagram"], true, "SETTINGS_H3_DATAGRAM")
+    XCTAssertEqual(settings["quicDatagrams"], true, "max_datagram_frame_size")
+  }
+
+  func testAnEngineWithoutDatagramsRefusesDatagramSessions() async throws {
+    let engine = try await createEngine()
+    try await openDatagrams(engine, callId: 1)
+    try await waitUntil("the session failed") { self.outcome(1) != nil }
+    XCTAssertEqual(outcome(1)?["type"] as? String, "failed")
+    XCTAssertEqual(outcome(1)?["domain"] as? String, "ConnectNativeHttp")
+    XCTAssertEqual(outcome(1)?["code"] as? Int, -2, "\(String(describing: outcome(1)))")
+    XCTAssertNil(event(1, "headers"), "the CONNECT request reached the server")
+    // The engine still carries calls.
+    try await open(engine, callId: 2, path: Self.say, contentType: "application/proto")
+    try await write(2, sentence("hi"))
+    try await invoke("end", ["callId": 2])
+    try await waitUntil("the call ended") { self.outcome(2) != nil }
+    XCTAssertEqual(outcome(2)?["type"] as? String, "done", "\(String(describing: outcome(2)))")
+  }
+
+  func testATooLargeDatagramIsRefused() async throws {
+    let engine = try await createEngine(datagrams: true)
     try await openDatagrams(engine, callId: 1)
     try await waitUntil("the session was accepted", timeout: 10) { self.event(1, "headers") != nil }
     let result = await reply("sendDatagram", ["callId": 1, "data": Data(count: 64 * 1024)])
@@ -383,10 +419,24 @@ final class HTTP3BridgeTests: XCTestCase {
     }
   }
 
-  private func createEngine() async throws -> Int {
+  private func createEngine(datagrams: Bool = false) async throws -> Int {
     let url = try XCTUnwrap(URL(string: serverURL))
     let origin: [Any] = [url.host!, url.port ?? 443]
-    return try await invoke("createEngine", ["http3Origins": [origin]]) as! Int
+    return try await invoke("createEngine", ["http3Origins": [origin], "datagrams": datagrams]) as! Int
+  }
+
+  /// What the test server saw of the engine's datagram support: test_server/client_settings.go's JSON.
+  private func advertisedSettings(_ engine: Int) async throws -> [String: Bool] {
+    try await invoke("open", [
+      "engineId": engine, "callId": 100, "url": serverURL + Self.clientSettings, "method": "GET",
+      "headers": [[String]](), "hasBody": false,
+    ])
+    try await invoke("end", ["callId": 100])
+    try await waitUntil("the settings arrived", timeout: 10) { self.outcome(100) != nil }
+    XCTAssertEqual(outcome(100)?["type"] as? String, "done", "\(String(describing: outcome(100)))")
+    XCTAssertEqual(event(100, "headers")?["status"] as? Int, 200)
+    let body = Data(received(100).utf8)
+    return try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Bool], received(100))
   }
 
   private func open(

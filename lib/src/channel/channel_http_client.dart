@@ -9,6 +9,7 @@ import '../datagram_session.dart';
 import '../native_http_client.dart';
 import '../native_http_config.dart';
 import '../native_http_exception.dart';
+import 'connect_end_stream.dart';
 
 /// A platform plugin that speaks this file's channel protocol: `createEngine`, `shutdownEngine`, `open`, `write`,
 /// `end` and `cancel` method calls, and `headers`, `data`, `trailers`, `responseComplete`, `done`, `failed` and
@@ -21,6 +22,7 @@ final class PlatformBridge {
     required this.events,
     required this.failure,
     this.responseHeaders = plainHeaders,
+    this.endsStreamsItself = true,
     this.supportsDatagrams = false,
   });
 
@@ -34,6 +36,11 @@ final class PlatformBridge {
 
   /// Builds the response headers connect-dart sees from a `headers` event's name and value pairs.
   final Headers Function(List<(String, String)> pairs) responseHeaders;
+
+  /// Whether the plugin ends a call once the server has sent the whole response, even while the request body is
+  /// still open. When it does not, the client watches Connect streaming responses for their end-stream message and
+  /// cancels the call itself once that arrives (see [ConnectEndStreamDetector]).
+  final bool endsStreamsItself;
 
   /// Whether the plugin opens datagram sessions ([NativeHttpClient.openDatagramSession]).
   final bool supportsDatagrams;
@@ -65,6 +72,7 @@ final class _Call {
   final ended = Completer<void>();
   final trailer = Headers();
   bool finished = false;
+  ConnectEndStreamDetector? endStream;
 
   /// Set when the call's signal fired, so the outcome reports the signal's error rather than the cancellation.
   Object? abortError;
@@ -216,6 +224,9 @@ final class _Dispatcher {
           for (final pair in (e['headers']! as List).cast<List<Object?>>()) (pair[0]! as String, pair[1]! as String),
         ]);
         final status = e['status']! as int;
+        if (!bridge.endsStreamsItself && isConnectStreamingContentType(headers.get('content-type')?.firstOrNull)) {
+          call.endStream = ConnectEndStreamDetector();
+        }
         final onResponse = _onResponse[id];
         if (onResponse != null) {
           // The caller's own callback: its failure is reported, and doesn't fail the call or leave it hanging.
@@ -229,9 +240,7 @@ final class _Dispatcher {
           call.response.complete(HttpResponse(status, headers, call.body.stream, call.trailer));
         }
       case 'data':
-        if (!call.finished) {
-          call.body.add(e['data']! as Uint8List);
-        }
+        _onData(id, call, e['data']! as Uint8List);
       case 'datagram':
         final datagrams = call.datagrams;
         if (datagrams != null && !datagrams.isClosed) {
@@ -253,6 +262,25 @@ final class _Dispatcher {
       case 'canceled':
         remove(id);
         call.fail(call.abortError ?? ConnectException(Code.canceled, '${bridge.name}: stream canceled'));
+    }
+  }
+
+  void _onData(int id, _Call call, Uint8List data) {
+    if (call.finished) {
+      return;
+    }
+    final detector = call.endStream;
+    if (detector == null) {
+      call.body.add(data);
+      return;
+    }
+    final used = detector.add(data);
+    if (used > 0) {
+      call.body.add(used == data.length ? data : Uint8List.sublistView(data, 0, used));
+    }
+    if (detector.done) {
+      call.completeResponse(bridge.name);
+      unawaited(cancel(id));
     }
   }
 }
@@ -391,7 +419,9 @@ base class ChannelHttpClient implements NativeHttpClient {
     Map<String, String> headers = const {},
   }) async {
     if (!_bridge.supportsDatagrams) {
-      throw UnsupportedError('${_bridge.name}: datagram sessions are not supported on this platform');
+      throw UnsupportedError(
+        '${_bridge.name}: datagram sessions need a client created with NativeHttpConfig.enableDatagrams, on iOS',
+      );
     }
     final dispatcher = _Dispatcher.of(_bridge);
     final call = _Call(url, datagramSession: true);
