@@ -100,8 +100,9 @@ jobs:
           go build -buildvcs=false -o connect-native-http-test-server .
           ./connect-native-http-test-server -addr :8443 -hosts localhost -certdir certs -admin-addr :8081 \
             > server.log 2>&1 &
+          # The swift image has no curl. The server logs this line once its TCP and UDP sockets are bound.
           for _ in $(seq 100); do
-            if curl -sf -X POST http://localhost:8081/unfreeze >/dev/null; then exit 0; fi
+            if grep -q 'listening:' server.log; then exit 0; fi
             sleep 0.1
           done
           echo "test server did not come up" >&2
