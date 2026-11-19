@@ -1,3 +1,6 @@
+// Apple platforms only: the bridge checks server certificates with Security, which Linux lacks.
+#if canImport(Security)
+
 import Foundation
 
 // Bridges URLSession to lib/src/url_session/url_session_http_client.dart, one task per call, with the same protocol
@@ -408,3 +411,5 @@ private final class TrustingDelegate: Delegate {
     completionHandler(disposition, credential)
   }
 }
+
+#endif

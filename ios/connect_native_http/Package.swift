@@ -1,14 +1,40 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 
 import PackageDescription
 
 // Flutter builds this package next to the FlutterFramework package it generates for the app. The Flutter-free core
-// and its tests also build on their own, without it:
+// and its tests also build on their own, without it, on macOS or Linux:
 //   CONNECT_NATIVE_HTTP_CORE_ONLY=1 swift test
+//
+// URLSessionBridge, the default on iOS, runs on iOS 15. HTTP3Bridge, which NativeHttpConfig.enableDatagrams selects,
+// runs on iOS or macOS 27, as swift-nio-http3 and swift-nio-quic do. Those libraries need Swift 6.4 to build, so the
+// package does too, whichever bridge an app uses.
 let coreOnly = Context.environment["CONNECT_NATIVE_HTTP_CORE_ONLY"] != nil
 
-let core = Target.target(name: "ConnectNativeHttpCore")
-let coreTests = Target.testTarget(name: "ConnectNativeHttpCoreTests", dependencies: ["ConnectNativeHttpCore"])
+let core = Target.target(
+    name: "ConnectNativeHttpCore",
+    dependencies: [
+        .product(name: "NIOCore", package: "swift-nio"),
+        .product(name: "NIOPosix", package: "swift-nio"),
+        .product(name: "HTTP3", package: "swift-nio-http3"),
+        .product(name: "NIOHTTP3", package: "swift-nio-http3"),
+        .product(name: "NIOQUIC", package: "swift-nio-quic"),
+        .product(name: "NIOQUICHelpers", package: "swift-nio-quic-helpers"),
+        .product(name: "HTTPTypes", package: "swift-http-types"),
+        .product(name: "NIOHTTPTypes", package: "swift-nio-extras"),
+        .product(name: "Logging", package: "swift-log"),
+        .product(name: "X509", package: "swift-certificates"),
+    ],
+    swiftSettings: [.enableExperimentalFeature("AnyAppleOSAvailability")]
+)
+let coreTests = Target.testTarget(
+    name: "ConnectNativeHttpCoreTests",
+    dependencies: [
+        "ConnectNativeHttpCore",
+        .product(name: "X509", package: "swift-certificates"),
+    ],
+    swiftSettings: [.enableExperimentalFeature("AnyAppleOSAvailability")]
+)
 let plugin = Target.target(
     name: "connect_native_http",
     dependencies: [
@@ -26,8 +52,17 @@ let package = Package(
     products: coreOnly ? [] : [
         .library(name: "connect-native-http", targets: ["connect_native_http"])
     ],
-    dependencies: coreOnly ? [] : [
-        .package(name: "FlutterFramework", path: "../FlutterFramework")
-    ],
-    targets: coreOnly ? [core, coreTests] : [core, plugin, coreTests]
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.104.0"),
+        // swift-nio-http3 has no release yet, so it is pinned to a commit.
+        .package(url: "https://github.com/apple/swift-nio-http3.git", revision: "b794b08960a69bc3337bc4838cc0ceb4332fdea6"),
+        .package(url: "https://github.com/apple/swift-nio-quic.git", .upToNextMinor(from: "0.6.0")),
+        .package(url: "https://github.com/apple/swift-nio-quic-helpers.git", .upToNextMinor(from: "0.1.2")),
+        .package(url: "https://github.com/apple/swift-http-types.git", from: "1.8.0"),
+        .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.22.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.12.1"),
+        .package(url: "https://github.com/apple/swift-certificates.git", from: "1.21.0"),
+    ] + (coreOnly ? [] : [.package(name: "FlutterFramework", path: "../FlutterFramework")]),
+    targets: coreOnly ? [core, coreTests] : [core, plugin, coreTests],
+    swiftLanguageModes: [.v5]
 )

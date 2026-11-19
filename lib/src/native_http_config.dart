@@ -4,8 +4,9 @@ final class NativeHttpResponseInfo {
 
   final Uri url;
 
-  /// The protocol the platform negotiated, as the platform names it: Cronet reports `h2` or `quic/1+spdy/3` (HTTP/3).
-  /// `null` when the platform does not expose it, as with URLSession.
+  /// The protocol the platform negotiated, as the platform names it: Cronet reports `h2` or `quic/1+spdy/3` (HTTP/3),
+  /// and the iOS client with [NativeHttpConfig.enableDatagrams] always `h3`. `null` when the platform does not expose
+  /// it, as with URLSession.
   final String? protocol;
 }
 
@@ -15,9 +16,11 @@ final class NativeHttpConfig {
   const NativeHttpConfig({
     this.http3Origins = const {},
     this.quicIdleTimeout,
+    this.connectTimeout,
     this.readIdleTimeout,
     this.deadlineStep,
     this.evictOnDeadline = false,
+    this.enableDatagrams = false,
     this.onResponse,
   });
 
@@ -26,6 +29,9 @@ final class NativeHttpConfig {
   ///
   /// Set this for origins that serve HTTP/3. Without it, URLSession learns HTTP/3 from `Alt-Svc` but uses it only for
   /// a new connection, and a busy session keeps reusing its first HTTP/2 connection indefinitely.
+  ///
+  /// With [enableDatagrams] on iOS, the list is unused: every call goes over HTTP/3, to any origin, with no fallback to
+  /// TCP.
   final Set<Uri> http3Origins;
 
   /// The QUIC idle timeout this client advertises, in whole seconds: how long an HTTP/3 connection may go without
@@ -33,8 +39,16 @@ final class NativeHttpConfig {
   /// so this bounds how long a dead network path goes unnoticed, as long as the server pings more often than this.
   /// `null` keeps the platform default.
   ///
-  /// Android only. URLSession exposes no QUIC settings, so on iOS only the server's advertised idle timeout applies.
+  /// On Android, Cronet takes whole seconds. On iOS it applies only with [enableDatagrams], and then any positive
+  /// duration works, rounded up to the millisecond. URLSession exposes no QUIC settings, so without it only the
+  /// server's advertised idle timeout applies.
   final Duration? quicIdleTimeout;
+
+  /// How long a new connection may take to resolve its host and finish the QUIC handshake before its calls fail as
+  /// never sent. `null` means 10 seconds. QUIC ignores ICMP errors, so an unreachable server is only noticed this way.
+  ///
+  /// iOS with [enableDatagrams] only. URLSession and Cronet have no setting; bound calls with deadlines instead.
+  final Duration? connectTimeout;
 
   /// Fails each of this client's calls once it has received nothing from the server for this long. `null` or
   /// [Duration.zero] means none. Each call has its own timer in the platform client, so it also works on the HTTP/2
@@ -47,13 +61,15 @@ final class NativeHttpConfig {
   /// - **What resets it:** anything the call receives. It runs from when the call starts, so it also bounds the wait
   ///   for the response headers, and a unary call the server holds longer than this fails. A server stream that may go
   ///   quiet needs a longer timeout, or periodic messages.
-  /// - **iOS:** `URLRequest.timeoutInterval`. URLSession fails the task with `NSURLErrorTimedOut` (-1001).
+  /// - **iOS:** `URLRequest.timeoutInterval`, or with [enableDatagrams] a timer in the bridge. Either fails the call
+  ///   with `NSURLErrorTimedOut` (-1001).
   /// - **Android:** a timer in the bridge, which fails the call with `net::ERR_TIMED_OUT` (-7).
   /// - **The failure:** a `ConnectException` with code `unavailable`, whose cause is a [NativeHttpException] with
   ///   that `platformCode`.
   /// - **The connection:** if nothing has arrived from the call's origin, on any call, since the call last received
-  ///   anything, the connection is taken to be dead. The client moves new calls to a fresh `URLSession` or Cronet
-  ///   engine, so they dial a new connection, and lets the calls already on the old one finish there.
+  ///   anything, the connection is taken to be dead. The client moves new calls to a fresh `URLSession`, a new QUIC
+  ///   connection (iOS with [enableDatagrams]) or a fresh Cronet engine, so they dial a new connection, and lets the
+  ///   calls already on the old one finish there.
   final Duration? readIdleTimeout;
 
   /// How much shorter a deadline the server gets than the call's own. connect-dart sends a call's deadline in
@@ -68,12 +84,30 @@ final class NativeHttpConfig {
 
   /// Whether a call that hits its deadline on the client moves new calls off its connection, as a [readIdleTimeout]
   /// does: if nothing has arrived from the call's origin, on any call, since the call last received anything, new
-  /// calls go to a fresh `URLSession` or Cronet engine. Calls already on the old connection are not canceled.
+  /// calls go to a fresh `URLSession`, a new QUIC connection (iOS with [enableDatagrams]) or a fresh Cronet engine.
+  /// Calls already on the old connection are not canceled.
   ///
   /// Use it with [deadlineStep]. Without one, the server enforces the same deadline as the client, but its clock
   /// starts later, so on a healthy connection the client's deadline usually fires before the server's
   /// `deadline_exceeded` arrives, and the connection is evicted for nothing.
   final bool evictOnDeadline;
+
+  /// Whether the client advertises HTTP datagram support to servers, so it can open datagram sessions
+  /// ([NativeHttpClient.openDatagramSession]). Each connection then sends QUIC's `max_datagram_frame_size` transport
+  /// parameter (RFC 9221) and HTTP/3's `SETTINGS_H3_DATAGRAM` (RFC 9297). Off by default.
+  ///
+  /// iOS 27 and later only. URLSession has no datagram API, so on iOS this swaps it for swift-nio-http3, with these
+  /// differences:
+  ///
+  /// - Every call goes over HTTP/3. There is no HTTP/2 fallback, so a network that blocks UDP fails every call.
+  /// - A rejected server certificate fails as `notSent` (`NSURLErrorSecureConnectionFailed`, -1200), not
+  ///   `untrusted`: the QUIC stack doesn't say why a TLS handshake failed.
+  /// - [quicIdleTimeout] and [connectTimeout] apply.
+  ///
+  /// On older iOS, [NativeHttpClient.create] throws a `PlatformException` with code `unsupported`. Cronet has no
+  /// datagram API either, so Android ignores this, and [NativeHttpClient.openDatagramSession] throws
+  /// [UnsupportedError] there.
+  final bool enableDatagrams;
 
   /// Called with each response's headers, before its body is read. An exception it throws goes to
   /// `FlutterError.onError`, and the call goes on.

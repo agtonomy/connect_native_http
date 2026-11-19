@@ -69,13 +69,24 @@ jobs:
         timeout-minutes: 5
         run: go test ./...
 
+  # HTTP3Bridge needs no Apple SDK, so its tests also run on Linux, where they don't wait for the simulator.
+  # URLSessionBridge is Apple-only and runs in the iOS job.
   swift-core:
-    name: Swift core tests (macOS)
-    runs-on: macos-latest
-    timeout-minutes: 10
+    name: Swift core tests (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.4.2-noble
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
+      # The SwiftPM build of swift-nio-http3 and its dependencies, which takes minutes from cold.
+      - name: Cache SwiftPM build
+        uses: actions/cache@v6
+        timeout-minutes: 5
+        with:
+          path: ios/connect_native_http/.build
+          key: swift-core-${{ hashFiles('ios/connect_native_http/Package.swift') }}
+          restore-keys: swift-core-
       - uses: actions/setup-go@v7
         timeout-minutes: 5
         with:
@@ -85,18 +96,20 @@ jobs:
         timeout-minutes: 5
         run: |
           cd test_server
-          go build -o connect-native-http-test-server .
+          # No VCS stamp: git refuses the checkout inside the container, whose owner differs from the container's user.
+          go build -buildvcs=false -o connect-native-http-test-server .
           ./connect-native-http-test-server -addr :8443 -hosts localhost -certdir certs -admin-addr :8081 \
             > server.log 2>&1 &
+          # The swift image has no curl. The server logs this line once its TCP and UDP sockets are bound.
           for _ in $(seq 100); do
-            if curl -sf -X POST http://localhost:8081/unfreeze >/dev/null; then exit 0; fi
+            if grep -q 'listening:' server.log; then exit 0; fi
             sleep 0.1
           done
           echo "test server did not come up" >&2
           cat server.log >&2
           exit 1
       - name: Swift tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         working-directory: ios/connect_native_http
         env:
           CONNECT_NATIVE_HTTP_CORE_ONLY: "1"
@@ -113,8 +126,9 @@ jobs:
 
   ios-integration:
     name: iOS integration tests (simulator)
-    runs-on: macos-latest
-    timeout-minutes: 30
+    # swift-nio-http3 needs Swift 6.4, which Xcode 26 doesn't have, and its HTTP/3 bridge needs an iOS 27 simulator.
+    runs-on: xcode-27
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -128,8 +142,8 @@ jobs:
             ~/Library/Developer/Xcode/DerivedData
             example/build/ios
             build/ios_core_tests
-          key: ios-builds-${{ hashFiles('.fvmrc', 'pubspec.yaml', 'lib/**', 'ios/**', 'example/pubspec.yaml', 'example/lib/**', 'example/ios/**', 'example/integration_test/**') }}
-          restore-keys: ios-builds-
+          key: ios-builds-xcode-27-${{ hashFiles('.fvmrc', 'pubspec.yaml', 'lib/**', 'ios/**', 'example/pubspec.yaml', 'example/lib/**', 'example/ios/**', 'example/integration_test/**') }}
+          restore-keys: ios-builds-xcode-27-
       - parallel:
           - uses: actions/setup-go@v7
             timeout-minutes: 5
@@ -142,8 +156,9 @@ jobs:
             with:
               post-setup-script: flutter config --enable-swift-package-manager
           # Needs neither Go nor Flutter, nor a booted simulator; the native step then finds it up to date.
+          # From cold, building swift-nio-http3 and its dependencies took 6 minutes (run 44430936460).
           - name: Build native bridge tests
-            timeout-minutes: 6
+            timeout-minutes: 15
             run: ios/connect_native_http/build_core_tests.sh build/ios_core_tests
           # simslim (github.com/MobAI-App/simslim) boots the simulator below with the background daemons the tests don't
           # use switched off. The release's prebuilt arm64 binary, checked against its hash.

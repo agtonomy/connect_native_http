@@ -1,6 +1,7 @@
 // Runs connect_native_http's platform client against ../test_server on a device or simulator. Start it through
 // ../run_integration_tests.sh, which starts the server, trusts its CA on the device and passes these defines.
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' as io;
 
 import 'package:connect_native_http/connect_native_http.dart';
@@ -44,6 +45,7 @@ final class Harness {
     Duration? readIdleTimeout,
     Duration? deadlineStep,
     bool evictOnDeadline = false,
+    bool enableDatagrams = false,
     bool useHttpGet = false,
   }) async {
     late final Harness harness;
@@ -53,6 +55,7 @@ final class Harness {
         readIdleTimeout: readIdleTimeout,
         deadlineStep: deadlineStep,
         evictOnDeadline: evictOnDeadline,
+        enableDatagrams: enableDatagrams,
         onResponse: (info) => harness.platformProtocols.add(info.protocol),
       ),
     );
@@ -557,4 +560,61 @@ void main() {
     expect(stopwatch.elapsed, lessThan(serverMaxIdle + const Duration(seconds: 2)));
     await requests.close();
   }, timeout: http3CaseTimeout);
+
+  // Datagram sessions need NativeHttpConfig.enableDatagrams, which on iOS swaps URLSession for swift-nio-http3.
+
+  testCase('a client without enableDatagrams opens no datagram sessions', (_) async {
+    final url = Uri.parse('$serverUrl/datagrams/echo');
+    expect(() => harness.native.openDatagramSession(url, protocol: 'datagram-echo'), throwsUnsupportedError);
+  });
+
+  testCase('with enableDatagrams, calls go over HTTP/3 and the client advertises datagram support', (_) async {
+    final datagrams = await Harness.create(serverUrl, enableDatagrams: true);
+    addTearDown(datagrams.native.close);
+    final url = Uri.parse('$serverUrl/datagrams/echo');
+    if (!io.Platform.isIOS) {
+      // Cronet has no datagrams; the option changes nothing there.
+      expect(() => datagrams.native.openDatagramSession(url, protocol: 'datagram-echo'), throwsUnsupportedError);
+      return;
+    }
+    final res = await datagrams.eliza.say(SayRequest(sentence: 'hi'), onHeader: datagrams.recordHeaders);
+    expect(res.sentence, 'say: hi');
+    expect(datagrams.serverProtocols.last, 'HTTP/3.0');
+    expect(datagrams.platformProtocols.last, 'h3');
+
+    // What the server saw of the client's QUIC transport parameters and HTTP/3 SETTINGS (test_server/client_settings.go).
+    final response = await datagrams.native.httpClient(
+      HttpRequest('$serverUrl/client-settings', 'GET', Headers(), null, null),
+    );
+    expect(response.status, 200);
+    final body = utf8.decode(await response.body.expand((chunk) => chunk).toList());
+    expect(jsonDecode(body), {'h3Datagram': true, 'quicDatagrams': true});
+  });
+
+  testCase('with enableDatagrams, a datagram session echoes datagrams', (_) async {
+    if (!io.Platform.isIOS) {
+      markTestSkipped('Cronet has no datagram sessions');
+      return;
+    }
+    final datagrams = await Harness.create(serverUrl, enableDatagrams: true);
+    addTearDown(datagrams.native.close);
+    final url = Uri.parse('$serverUrl/datagrams/echo');
+    final session = await datagrams.native.openDatagramSession(url, protocol: 'datagram-echo');
+    expect(session.status, 200);
+    final echoes = StreamIterator(session.datagrams);
+    // Datagrams may be lost, even locally; resend until each comes back.
+    for (final text in ['one', 'two']) {
+      final payload = Uint8List.fromList(text.codeUnits);
+      var echoed = false;
+      for (var attempt = 0; attempt < 5 && !echoed; attempt++) {
+        await session.send(payload);
+        echoed = await echoes.moveNext().timeout(const Duration(seconds: 1), onTimeout: () => false);
+      }
+      expect(echoed, isTrue, reason: 'no echo of $text');
+      expect(String.fromCharCodes(echoes.current), text);
+    }
+    await session.close();
+    await session.done;
+    expect(await echoes.moveNext(), isFalse);
+  });
 }

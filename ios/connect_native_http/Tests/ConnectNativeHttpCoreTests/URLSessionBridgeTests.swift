@@ -1,3 +1,6 @@
+// Apple platforms only, as URLSessionBridge is.
+#if canImport(Security)
+
 import Foundation
 import XCTest
 
@@ -274,3 +277,5 @@ private func envelope(_ payload: Data) -> Data {
   let n = UInt32(payload.count)
   return Data([0, UInt8(n >> 24), UInt8(n >> 16 & 0xFF), UInt8(n >> 8 & 0xFF), UInt8(n & 0xFF)]) + payload
 }
+
+#endif

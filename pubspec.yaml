@@ -1,8 +1,8 @@
 name: connect_native_http
 description: >-
-  connect-dart HttpClients on the platform HTTP stacks, URLSession on iOS and Cronet on Android, so Connect calls
-  can use HTTP/3 with full-duplex streams.
-version: 0.1.0
+  connect-dart HttpClients over HTTP/3 with full-duplex streams, swift-nio-http3 on iOS and Cronet on Android, plus
+  HTTP/3 datagram sessions on iOS.
+version: 0.2.0
 publish_to: none
 
 environment:

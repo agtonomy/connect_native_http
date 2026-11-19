@@ -3,6 +3,10 @@
 connect-dart `HttpClient`s that run on the platform's own HTTP stack: URLSession on iOS, and Cronet on Android. The platform negotiates HTTP/3 (QUIC) or HTTP/2 itself, falls back to HTTP/2 over TCP when QUIC fails, and
 carries full-duplex streams, so all four Connect RPC kinds work, bidi included.
 
+On iOS 27 and later, `NativeHttpConfig.enableDatagrams` swaps URLSession for
+[swift-nio-http3](https://github.com/apple/swift-nio-http3), which advertises HTTP/3 datagram support to servers and
+opens datagram sessions. See "HTTP datagrams (iOS 27+, opt-in)".
+
 Status: experimental.
 
 ## Use
@@ -50,7 +54,7 @@ No exception in the package should crash the app or leave a call hanging. Failur
   carries on.
 
 `NativeHttpClient.create` throws a `PlatformException` if the platform can't create a client, for example when Cronet's
-native library fails to load.
+native library fails to load, or when `enableDatagrams` is set before iOS 27 (code `unsupported`).
 
 ### Read-idle timeout
 
@@ -106,6 +110,86 @@ NativeHttpConfig(
   a fresh `URLSession` or `CronetEngine`, which dials its own connections. Calls already on the old one are not
   canceled. They finish there, and it is released after the last one ends. Several calls that run out of time on the
   same connection evict it once.
+
+## HTTP datagrams (iOS 27+, opt-in)
+
+URLSession has no HTTP datagram API. With `NativeHttpConfig(enableDatagrams: true)`, the iOS client runs on
+swift-nio-http3 and [swift-nio-quic](https://github.com/apple/swift-nio-quic) instead, and every connection advertises
+datagram support: QUIC's `max_datagram_frame_size` transport parameter (RFC 9221) and HTTP/3's `SETTINGS_H3_DATAGRAM`
+(RFC 9297). Without the option, neither is sent and nothing changes. Android ignores it, since Cronet has no datagram
+API either.
+
+The swift-nio-http3 client carries Connect calls too, through the same `httpClient`, with these differences from
+URLSession:
+
+- **iOS 27.** swift-nio-http3 and swift-nio-quic mark their APIs `@available(iOS 27, macOS 27, …)`. On older iOS,
+  `NativeHttpClient.create` throws a `PlatformException` with code `unsupported`.
+- **HTTP/3 only.** There is no HTTP/2 fallback, so where UDP is blocked every call fails as `notSent`.
+  `http3Origins` is unused.
+- **Failures.** A rejected server certificate fails as `notSent` (`NSURLErrorSecureConnectionFailed`, -1200), not
+  `untrusted`: the QUIC stack doesn't say why a TLS handshake failed. Read-idle timeouts (-1001) and dropped
+  connections (-1005) are `other`, as with URLSession.
+- **Settings.** `quicIdleTimeout` applies (any positive duration, rounded up to the millisecond), and so does
+  `connectTimeout`: 10 s by default, it bounds how long a new connection may take to resolve its host and finish the
+  QUIC handshake, after which its calls fail as `notSent` (-1004). QUIC ignores the ICMP error a closed UDP port
+  answers with, so without it a server that isn't there would hold calls until their deadlines.
+- **Negotiated protocol.** `NativeHttpResponseInfo.protocol` is `h3`.
+- **Ending bidi calls.** The bridge ends a call on the response's end, so the Connect end-stream detector isn't needed.
+  A server that has its answer typically also stops reading the request (`STOP_SENDING`); swift-nio-http3 sets
+  swift-nio-quic's `halfCloseOnStopSending` on every request stream
+  ([apple/swift-nio-http3#104](https://github.com/apple/swift-nio-http3/pull/104)), so that closes only the request
+  side.
+- **No write backpressure.** A write completes once swift-nio-quic has buffered it, so a server that stops reading
+  leaves the rest in memory.
+- **Pre-1.0 dependencies.** swift-nio-http3 has no release yet and is pinned to a commit in
+  `ios/connect_native_http/Package.swift`; swift-nio-quic is taken `.upToNextMinor(from: "0.6.0")`. Both say their APIs
+  aren't stable. Moving the pin is a deliberate change to test.
+- **A QUIC stack in Swift, on BSD sockets.** swift-nio-quic implements QUIC itself (swift-network-evolution, SwiftTLS)
+  on NIO's POSIX sockets, not Network.framework. System proxy settings and Wi-Fi Assist don't apply, and moving between
+  networks has not been tested; expect a dropped connection, which the next call redials.
+- **Logging.** swift-nio-quic logs through swift-log. With no logging backend set up, swift-log prints to stdout,
+  which includes notices for every stream reset and TLS failure. An app can call `LoggingSystem.bootstrap` to route or
+  silence it.
+
+**Every app needs Xcode 27 (Swift 6.4) to build the plugin, with or without the option:** swift-nio-http3's manifest
+needs Swift tools 6.4, and Swift Package Manager resolves every dependency of a package. The plugin's minimum stays iOS
+15.
+
+### Datagram sessions
+
+A datagram session is an Extended CONNECT request (RFC 9220) whose stream stays open. Both sides can send HTTP
+datagrams (RFC 9297) on it: unreliable, unordered messages that each fit in one QUIC packet. It shares its QUIC
+connection with the client's RPCs to the same origin.
+
+```dart
+final native = await NativeHttpClient.create(const NativeHttpConfig(enableDatagrams: true));
+final session = await native!.openDatagramSession(
+  Uri.parse('https://example.com/telemetry'),
+  protocol: 'my-datagrams', // the :protocol pseudo-header; the server routes on it
+  headers: {'authorization': 'Bearer …'},
+);
+session.datagrams.listen((datagram) => handle(datagram));
+await session.send(Uint8List.fromList(payload));
+// …
+await session.close(); // finishes the request stream; `done` completes when the server ends the session
+await session.done;
+```
+
+- **Opening** throws `UnsupportedError` on a client without `enableDatagrams`, and on Android. Otherwise it waits for
+  the server's HTTP/3 SETTINGS. If the server doesn't offer both `SETTINGS_H3_DATAGRAM` and
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`, it fails with a `ConnectException` (`unavailable`, `NativeHttpException` cause)
+  without sending anything. A server that answers with a status other than 2xx gets `DatagramSessionRejected`.
+- **`send`** completes once QUIC has taken the datagram, which says nothing about delivery. It throws a
+  `NativeHttpException` if the session has ended or the datagram is too large for the connection.
+- **`datagrams`** buffers what arrives while nothing listens, and ends with the session, with the session's error if
+  it failed. **`data`** carries anything the server writes on the stream itself, such as capsules.
+- **Ending:** `close()` finishes the request stream and the server is expected to end its side; `cancel()` resets the
+  stream at once. The connection's QUIC idle timeout and the client's `readIdleTimeout` apply as they do to calls.
+  Datagrams count as received for the read-idle timeout.
+
+The test server's `/datagrams/echo` (`test_server/datagrams.go`) shows the server side in quic-go: set
+`http3.Server.EnableDatagrams`, accept the CONNECT with `WriteHeader(200)`, take the stream over with
+`http3.HTTPStreamer`, and use `ReceiveDatagram` and `SendDatagram`.
 
 ## Server and infrastructure requirements
 
@@ -163,7 +247,7 @@ found or verified with the tests in this package.
 
 | | iOS | Android |
 |---|---|---|
-| Stack | URLSession, through the Swift plugin in `ios/` (Swift Package Manager only) | Cronet `BidirectionalStream`, through the Kotlin plugin in `android/` |
+| Stack | URLSession, through the Swift plugin in `ios/` (Swift Package Manager only); swift-nio-http3 with `enableDatagrams` (see "HTTP datagrams") | Cronet `BidirectionalStream`, through the Kotlin plugin in `android/` |
 | HTTP/3 | From the first request for `http3Origins`; otherwise learned from `Alt-Svc` | Same |
 | Certificates | System trust store | System trust store; QUIC only with certificates that chain to a public root |
 | Negotiated protocol | Not exposed (`NativeHttpResponseInfo.protocol` is `null`) | `h2` or `quic/1+spdy/3` (HTTP/3) |
@@ -244,7 +328,8 @@ Neither platform finishes a stream on its own while the client still has its req
 
 ### Design notes
 
-- Both platforms use a small native plugin behind the same method and event channel protocol, and one Dart adapter
+- Both platforms use a small native plugin behind the same method and event channel protocol (the swift-nio-http3
+  bridge adds the datagram methods and events), and one Dart adapter
   (`lib/src/channel/`) turns it into a connect-dart `HttpClient`. The package depends only on `connectrpc` and Flutter,
   so it can't conflict with an app over shared native-interop packages.
 - `package:cupertino_http` isn't used: it builds its URLSession delegate in Dart through `package:objective_c`, which
@@ -258,7 +343,8 @@ Neither platform finishes a stream on its own while the client still has its req
 ## Tests
 
 - **`test/`:** host unit tests, runnable on Linux CI. They cover error classification, Connect end-stream detection,
-  URLSession response headers, and the shared channel adapter against a fake plugin.
+  URLSession response headers, which client `NativeHttpClient.create` picks for each platform and `enableDatagrams`,
+  and the shared channel adapter and datagram sessions against fake plugins.
 - **`test_server/`:** a Go server for `connectrpc.eliza.v1.ElizaService` over HTTP/2 and HTTP/3, scripted for tests
   (see `eliza.go`).
   - `-max-idle` and `-keepalive` set its QUIC idle timeout and ping interval.
@@ -268,8 +354,12 @@ Neither platform finishes a stream on its own while the client still has its req
       clients already have. It drops what they send and what the server writes, then closes them. Connections opened
       later work, so a client that dials again gets through.
     - `POST /unfreeze` ends both.
-  - Its own tests (`go test ./...`) check it over HTTP/3, including the idle timeout, pings and freezing, and check
-    the TCP freeze over HTTP/2.
+  - `/datagrams/echo` accepts Extended CONNECT with `:protocol` `datagram-echo` and echoes every HTTP datagram. A
+    datagram `close` ends the session from the server's side.
+  - `GET /client-settings`, over HTTP/3, answers with the datagram support the client advertised, as JSON:
+    `{"h3Datagram": …, "quicDatagrams": …}`.
+  - Its own tests (`go test ./...`) check it over HTTP/3, including the idle timeout, pings, freezing, the datagram
+    echo and `/client-settings`, and check the TCP freeze over HTTP/2.
   - It creates a CA in `test_server/certs/` on first start and reuses it, so a device only has to trust it once.
   - With `QLOGDIR` set, it writes a qlog trace of each QUIC connection there, which shows the server's side of a
     handshake.
@@ -293,6 +383,10 @@ Neither platform finishes a stream on its own while the client still has its req
   before any Alt-Svc, must reach HTTP/3 within a few fresh clients. A loaded simulator sometimes lets TCP win
   URLSession's race even locally, so a single fallback is logged rather than failed.
 
+  Three cases cover `enableDatagrams`: a default client opens no datagram sessions; with the option, calls go over
+  HTTP/3 (`h3`) and the server sees both datagram settings from the client; and a datagram session echoes datagrams.
+  On Android the option leaves datagram sessions unsupported.
+
   The script starts the server with a 3 s idle timeout and 1 s pings. Over HTTP/3 (iOS) the tests also check two
   things: a quiet stream outlives the idle timeout, and a frozen path fails an open stream within it.
 
@@ -307,14 +401,23 @@ Neither platform finishes a stream on its own while the client still has its req
   - With `deadlineStep`, the server answers a deadline a step before the client's, and the client stays on the same
     connection.
 - **Native bridge tests:** the same script runs them after the Dart tests, against the same server. Each platform's
-  bridge (`URLSessionBridge`, `CronetBridge`) has no Flutter dependency, and the tests call it directly, for behavior
+  bridge (`URLSessionBridge`, `HTTP3Bridge`, `CronetBridge`) has no Flutter dependency, and the tests call it directly, for behavior
   Dart can't reach:
   - **iOS (`ios/connect_native_http/Tests`, XCTest):** a write stuck on a full buffer returns once the call is
     canceled or its connection fails; a redirect of a request with a body is returned, not followed; shutting a
     session down lets its calls finish and refuses new ones; a read-idle timeout fails a quiet call with
     `NSURLErrorTimedOut`, and the engine's next call works; a call canceled at its deadline ends at once, and the
-    engine's next call works. The script runs them on the simulator. For a quick loop on the Mac, against a running
-    test server:
+    engine's next call works.
+
+    `HTTP3Bridge`'s tests cover the same ground over HTTP/3, plus: unary calls share one connection; a call ends with
+    its response while its request side is still open; a certificate from another CA fails the handshake; the QUIC
+    idle timeout fails a call on a frozen path. An engine created without `datagrams` advertises no datagram support
+    (checked through `/client-settings`) and refuses datagram sessions without sending them; one created with it
+    advertises both. Datagram sessions echo datagrams, may send before the server answers, end when the server ends
+    them, share a connection with calls and other sessions, and refuse an oversized datagram without ending.
+    `HTTP3Bridge` builds without Apple's SDKs, so CI also runs its tests on Linux in the `swift:6.4.2` image.
+
+    The script runs them on the simulator. For a quick loop on the Mac, against a running test server:
 
     ```bash
     cd ios/connect_native_http && CONNECT_NATIVE_HTTP_CORE_ONLY=1 SERVER_URL=https://localhost:8443 \

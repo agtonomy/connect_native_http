@@ -5,6 +5,7 @@ import 'package:connectrpc/connect.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import '../datagram_session.dart';
 import '../native_http_client.dart';
 import '../native_http_config.dart';
 import '../native_http_exception.dart';
@@ -12,7 +13,8 @@ import 'connect_end_stream.dart';
 
 /// A platform plugin that speaks this file's channel protocol: `createEngine`, `shutdownEngine`, `open`, `write`,
 /// `end` and `cancel` method calls, and `headers`, `data`, `trailers`, `responseComplete`, `done`, `failed` and
-/// `canceled` events.
+/// `canceled` events. A plugin that [supportsDatagrams] also takes `openDatagrams` and `sendDatagram` calls, and sends
+/// `datagram` events.
 final class PlatformBridge {
   const PlatformBridge({
     required this.name,
@@ -21,6 +23,7 @@ final class PlatformBridge {
     required this.failure,
     this.responseHeaders = plainHeaders,
     this.endsStreamsItself = true,
+    this.supportsDatagrams = false,
   });
 
   /// Prefixes the plugin's error messages, such as `cronet`.
@@ -38,6 +41,9 @@ final class PlatformBridge {
   /// still open. When it does not, the client watches Connect streaming responses for their end-stream message and
   /// cancels the call itself once that arrives (see [ConnectEndStreamDetector]).
   final bool endsStreamsItself;
+
+  /// Whether the plugin opens datagram sessions ([NativeHttpClient.openDatagramSession]).
+  final bool supportsDatagrams;
 }
 
 Headers plainHeaders(List<(String, String)> pairs) {
@@ -49,7 +55,7 @@ Headers plainHeaders(List<(String, String)> pairs) {
 }
 
 final class _Call {
-  _Call(this.url) {
+  _Call(this.url, {bool datagramSession = false}) : datagrams = datagramSession ? StreamController<Uint8List>() : null {
     // A failure event can arrive before the `open` reply, so before `_send` has handed this future to its caller.
     // The caller still gets the error; this keeps it from also being reported as unhandled in the meantime.
     response.future.ignore();
@@ -58,6 +64,12 @@ final class _Call {
   final Uri url;
   final response = Completer<HttpResponse>();
   final body = StreamController<Uint8List>();
+
+  /// A datagram session's incoming datagrams; `null` for other calls.
+  final StreamController<Uint8List>? datagrams;
+
+  /// Completes when the call has ended, with its error if it failed.
+  final ended = Completer<void>();
   final trailer = Headers();
   bool finished = false;
   ConnectEndStreamDetector? endStream;
@@ -70,6 +82,17 @@ final class _Call {
 
   void fail(Object error) {
     finished = true;
+    if (!ended.isCompleted) {
+      ended.completeError(error);
+      // Only a datagram session's caller waits on it; others see the error through the response.
+      ended.future.ignore();
+    }
+    final datagrams = this.datagrams;
+    if (datagrams != null && !datagrams.isClosed) {
+      datagrams
+        ..addError(error)
+        ..close();
+    }
     if (!response.isCompleted) {
       response.completeError(error);
     }
@@ -85,6 +108,10 @@ final class _Call {
   /// The server sent the whole response, so nothing more is sent.
   void completeResponse(String bridgeName) {
     finished = true;
+    if (!ended.isCompleted) {
+      ended.complete();
+    }
+    datagrams?.close();
     if (!response.isCompleted) {
       response.completeError(ConnectException(Code.internal, '$bridgeName: response ended without headers'));
     }
@@ -188,7 +215,7 @@ final class _Dispatcher {
   }
 
   void _onCallEvent(int id, _Call call, Map<String, Object?> e) {
-    if (const {'headers', 'data', 'trailers'}.contains(e['type'])) {
+    if (const {'headers', 'data', 'trailers', 'datagram'}.contains(e['type'])) {
       call.sinceReceived.reset();
     }
     switch (e['type']) {
@@ -214,6 +241,11 @@ final class _Dispatcher {
         }
       case 'data':
         _onData(id, call, e['data']! as Uint8List);
+      case 'datagram':
+        final datagrams = call.datagrams;
+        if (datagrams != null && !datagrams.isClosed) {
+          datagrams.add(e['data']! as Uint8List);
+        }
       case 'trailers':
         for (final pair in (e['headers']! as List).cast<List<Object?>>()) {
           call.trailer.add(pair[0]! as String, pair[1]! as String);
@@ -381,5 +413,96 @@ base class ChannelHttpClient implements NativeHttpClient {
   }
 
   @override
+  Future<DatagramSession> openDatagramSession(
+    Uri url, {
+    required String protocol,
+    Map<String, String> headers = const {},
+  }) async {
+    if (!_bridge.supportsDatagrams) {
+      throw UnsupportedError(
+        '${_bridge.name}: datagram sessions need a client created with NativeHttpConfig.enableDatagrams, on iOS',
+      );
+    }
+    final dispatcher = _Dispatcher.of(_bridge);
+    final call = _Call(url, datagramSession: true);
+    final id = dispatcher.register(call, _config.onResponse);
+    try {
+      await _bridge.methods.invokeMethod<void>('openDatagrams', {
+        'engineId': _engineId,
+        'callId': id,
+        'url': url.toString(),
+        'protocol': protocol,
+        'headers': [
+          for (final MapEntry(:key, :value) in headers.entries) [key, value],
+        ],
+        'readIdleTimeoutMs': _readIdleTimeoutMs,
+      });
+    } catch (error) {
+      dispatcher.remove(id);
+      call.finished = true;
+      final cause = NativeHttpException(NativeHttpFailure.notSent, '${_bridge.name}: open failed: $error');
+      throw ConnectException(Code.unavailable, cause.message, cause: cause);
+    }
+    final response = await call.response.future;
+    final session = _DatagramSession(_bridge, dispatcher, id, call, response);
+    if (response.status < 200 || response.status > 299) {
+      await session.cancel();
+      throw DatagramSessionRejected(response.status, response.header);
+    }
+    return session;
+  }
+
+  @override
   Future<void> close() => _bridge.methods.invokeMethod<void>('shutdownEngine', {'engineId': _engineId});
+}
+
+final class _DatagramSession implements DatagramSession {
+  _DatagramSession(this._bridge, this._dispatcher, this._id, this._call, this._response);
+
+  final PlatformBridge _bridge;
+  final _Dispatcher _dispatcher;
+  final int _id;
+  final _Call _call;
+  final HttpResponse _response;
+
+  @override
+  int get status => _response.status;
+
+  @override
+  Headers get headers => _response.header;
+
+  @override
+  Stream<Uint8List> get datagrams => _call.datagrams!.stream;
+
+  @override
+  Stream<Uint8List> get data => _response.body;
+
+  @override
+  Future<void> send(Uint8List datagram) async {
+    if (_call.finished) {
+      throw NativeHttpException(NativeHttpFailure.other, '${_bridge.name}: the datagram session has ended');
+    }
+    try {
+      await _bridge.methods.invokeMethod<void>('sendDatagram', {'callId': _id, 'data': datagram});
+    } on PlatformException catch (error) {
+      throw NativeHttpException(NativeHttpFailure.other, '${_bridge.name}: datagram not sent: ${error.message}');
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    if (!_call.finished) {
+      await _bridge.methods.invokeMethod<void>('end', {'callId': _id});
+    }
+  }
+
+  @override
+  Future<void> cancel() async {
+    if (!_call.finished) {
+      await _dispatcher.cancel(_id);
+    }
+  }
+
+  @override
+  Future<void> get done => _call.ended.future;
 }

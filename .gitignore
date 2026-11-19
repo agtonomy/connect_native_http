@@ -44,3 +44,6 @@ ios/connect_native_http/.swiftpm/
 # Test server build output and the certificates it writes
 test_server/connect-native-http-test-server
 test_server/certs/
+
+# SwiftPM: the core package resolves its own dependencies; Flutter resolves the app's.
+ios/connect_native_http/Package.resolved
