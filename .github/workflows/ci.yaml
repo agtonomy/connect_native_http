@@ -128,7 +128,7 @@ jobs:
     name: iOS integration tests (simulator)
     # swift-nio-http3 needs Swift 6.4, which Xcode 26 doesn't have, and its HTTP/3 bridge needs an iOS 27 simulator.
     runs-on: xcode-27
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -156,8 +156,9 @@ jobs:
             with:
               post-setup-script: flutter config --enable-swift-package-manager
           # Needs neither Go nor Flutter, nor a booted simulator; the native step then finds it up to date.
+          # Cold, building swift-nio-http3 and its dependencies took 6 minutes; cached, well under one.
           - name: Build native bridge tests
-            timeout-minutes: 6
+            timeout-minutes: 15
             run: ios/connect_native_http/build_core_tests.sh build/ios_core_tests
           # simslim (github.com/MobAI-App/simslim) boots the simulator below with the background daemons the tests don't
           # use switched off. The release's prebuilt arm64 binary, checked against its hash.
